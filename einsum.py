@@ -204,7 +204,7 @@ def gather_labels(labels_list, bcast_ndims):
 
 def gather_singular_labels(labels_list, alphabet_only=True):
     '''
-    Returns the labels that appear only once
+    Returns the labels which only show in one operand
     Parameter alphabet_only indicates whether to count labels in [a-z] only
     '''
     all_labels = sorted(''.join(labels_list))    
@@ -455,12 +455,42 @@ def get_binop(x, y, global_axes_index, summation_counter, ndim):
                 
             return dot
 
-def transpose_align(x_labels, x_shape, y_labels, y_shape, ):
+def BIJK(x_labels, y_labels, to_combine):
     '''
-    Try to transpose and align the operand dimensions to match labels, 
-    broadcasting dims are positioned at the front
-    Returns x_perm, y_perm, x_n, y_n
+    Lay out dimensions in the B... I... J... K... pattern, 
+    where B... represents broadcasting dimensions, 
+          I... label matched and not yet to be combined dimensions, both output and not output,
+          J... label not matched dimensions and output dimensions,
+          K... label matched and should immediately combined dimensions
     '''
+    x_b, x_i, x_j, x_k = [[] for i in range(4)]
+    y_b, y_i, y_j, y_k = [[] for i in range(4)]
+
+    x_k_items, x_i_items, y_k_items, y_i_items = [[] for i in range(4)]
+
+    for i, l in enumerate(x_labels):
+        if l == '.':
+            x_b.append(i)
+        elif l in to_combine:
+            x_k_items.append((l, i))
+        elif l in y_labels:
+            x_i_items.append((l. i))
+        else:
+            x_j.append(i)
+
+    for i, l in enumerate(y_labels):
+        if l == '.':
+            y_b.append(i)
+        elif l in to_combine:
+            y_k_items.append((l, i))
+        elif l in x_labels:
+            y_i_items.append((l. i))
+        else:
+            y_j.append(i)
+
+
+    x_bijk = []
+    y_bijk = []
     pass
 
 def labels_to_axes(labelstr, labels):
@@ -472,25 +502,23 @@ class Plan:
         steps = []
 
     def add_step(self, step):
-        steps.append(step)
+        self.steps.append(step)
 
     def get_topvar(self):
-        return env[-1] if env else None
+        return self.env[-1] if self.env else None
 
     def execute(self):
-        for step in steps:
+        env = self.env
+        for step in self.steps:
             f, *args = step
             res_var = f(*args)
             env.append(res_var)
         return env[-1]
 
-def plan_einsum(operands, nop_labels, output_labels, label_count):
+def plan_einsum(operands, nop_labels, output_labels, combined_labels, label_count):
     '''
-    Plans the actual execution steps for this einsum request.
+    Plans the actual execution steps.
 
-    Parameters
-    ----------
-    
     Results
     -------
     the execution plan
@@ -504,16 +532,15 @@ def plan_einsum(operands, nop_labels, output_labels, label_count):
     for var, var_labels in zip(operands, nop_labels):
         # plan a single step
         # find which dimensions are ready to be combined or reduced
-        #    Relevant labels are those which are 1) not in output and 2) in this operand
-        #                   
-        to_reduce, to_fold = []
+        #    Relevant labels are those which are 1) not in output and 2) in this operand               
+        to_reduce, to_combine = []
         var_shape = var.shape
         prev_var = plan.get_topvar()
     
-        for l in var_labels.replace('.', ''):
-            if l not in output_labels and label_count[l] == 1:
+        for l in combined_labels:
+            if label_count[l] == 1 and l in var_labels:
                 if l in prev_var_labels:
-                    to_fold.append(l)
+                    to_combine.append(l)
                 else:
                     to_reduce.append(l)
 
@@ -529,19 +556,21 @@ def plan_einsum(operands, nop_labels, output_labels, label_count):
             # Update var shape
             var_shape = [s for i, s in enumerate(var_shape) if i not in axes]
 
-        # We like to arrange the dimensions in the following way:
+        # We'd like to arrange the dimensions in the following way:
         # [B.... I...  J... K...]
         # [B.... I...  J... K...]
         # where B... represents broadcasting dimensions, 
         #       I... label matched and not yet to be combined dimensions, both output and not output
         #       J... label not matched dimensions and output dimensions
         #       K... label matched and should immediately combined dimensions
-
-        if prev_var:
-            transpose_align(prev_var_labels, prev_var_shape, var_labels, var_shape)
+        # We then inspect the layout and see if the summation can be specialized.  
+        # Current specialization schemes:
+        #  (1) if B... I... K... not empty, and J... empty, then the summation can be turned into dot
+        #  (2) if J... not empty, K... not empty, then the summation can be turned into matmul
+        #  (3) otherwise, make a broadcast *
 
         # There are dimensions to fold
-        if to_fold:
+        if to_combine:
             # Distinguish dot and matmal
             # dot if prev_var and var's shapes perfectly match on all labeled and broadcasting dims
             #    we need axes to do the comparison
@@ -660,7 +689,7 @@ def einsum(equation, *operands):
     assert len(rhs) < 2, "Invalid equation: multiple `->` were found."
     rhs = rhs[0] if rhs else ''
 
-    # Parse labels for each operand and count the number of occurrences for each label
+    # Parse labels for each operand and count the number of occurrences for each alphabet label
     nop_labels, label_count = parse_and_count_labels(lhs, operands)
 
     # Diagonalize the operands which have duplicate labels
@@ -680,16 +709,16 @@ def einsum(equation, *operands):
         output_labels = infer_output_labels(nop_labels, n_bcast_dims)
 
     # The rest labels need to be combined.
-    combined_ = label_count.keys()
+    combined_labels = label_count.keys()
     for l in output_labels:
-        combined.remove(l)    
+        combined_labels.remove(l)
 
     # Now we're ready to build up an execution plan
-    args = [operands, nop_labels, output_labels, label_count]
+    args = [operands, nop_labels, output_labels, combined_labels, label_count]
     plan = plan_einsum(*args)
     result = plan.execute()
 
-    return result_var
+    return result
 
 
 
