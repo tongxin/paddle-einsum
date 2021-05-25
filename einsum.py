@@ -370,8 +370,7 @@ def dims_index(in_labels, out_labels):
 
     return inv_map
 
-def verify_shape(axes_index):
-    operands, axes_list = zip(*axes_index.items())
+def verify_shape(axes_list, operands):
     op_shapes = [op.shape for op in operands]
     for axes in zip(*axes_list):
         # axes are a column of nop input dimension axes. -1 represents new axis
@@ -455,67 +454,73 @@ def get_binop(x, y, global_axes_index, summation_counter, ndim):
                 
             return dot
 
-def BIJK(x_labels, y_labels, to_combine):
-    '''
-    Lay out dimensions in the B... I... J... K... pattern, 
-    where B... represents broadcasting dimensions, 
-          I... label matched and not yet to be combined dimensions, both output and not output,
-          J... label not matched dimensions and output dimensions,
-          K... label matched and should immediately combined dimensions
-    '''
-    x_b, x_i, x_j, x_k = [[] for i in range(4)]
-    y_b, y_i, y_j, y_k = [[] for i in range(4)]
+def summation_kind(prev_var_axes, var_axes, prev_var_shape, var_shape, to_combine):
+    ndims = len(var_axes)
+    K_axes = to_combine
+    I_axes = [i for i, pre_var_ax, var_ax in zip(range(ndims), prev_var_axes, var_axes) \
+                if i not in to_combine and prev_var_ax != -1 and var_ax != -1]
+    J_axes = [i for i, pre_var_ax, var_ax in zip(range(ndims), prev_var_axes, var_axes) \
+                if i not in to_combine and ((prev_var_ax != -1) != (var_ax != -1))]
 
-    x_k_items, x_i_items, y_k_items, y_i_items = [[] for i in range(4)]
+    if K_axes:
+        K_perm = list(zip(prev_var_axes[i], var_axes[i] for i in K_axes))
+    if I_axes:
+        I_perm = list(zip(prev_var_axes[i], var_axes[i] for i in I_axes))
+    if J_axes:
+        J_perm = list(zip(prev_var_axes[i], var_axes[i] for i in J_axes))
+    
+    I_shape_matched = all(prev_var_shape[prev_var_axes[i]] == var_shape[var_axes[i]] for i in I_axes)
+    K_shape_matched = all(prev_var_shape[prev_var_axes[i]] == var_shape[var_axes[i]] for i in K_axes)
 
-    for i, l in enumerate(x_labels):
-        if l == '.':
-            x_b.append(i)
-        elif l in to_combine:
-            x_k_items.append((l, i))
-        elif l in y_labels:
-            x_i_items.append((l. i))
-        else:
-            x_j.append(i)
-
-    for i, l in enumerate(y_labels):
-        if l == '.':
-            y_b.append(i)
-        elif l in to_combine:
-            y_k_items.append((l, i))
-        elif l in x_labels:
-            y_i_items.append((l. i))
-        else:
-            y_j.append(i)
-
-
-    x_bijk = []
-    y_bijk = []
-    pass
+    if K_axes and not J_axes and I_shape_matched and K_shape_matched:
+        return 'dot', I_perm, K_perm
+    elif K_axes and K_shape_matched and J_axes:
+        return 'matmul', I_perm, J_perm, K_perm
+    else:
+        return '*'
 
 def labels_to_axes(labelstr, labels):
     return [i for i, l in enumerate(labelstr) if l in labels]
 
 class Plan:
     def __init__(self):
-        env = []
+        env = {}
         steps = []
 
     def add_step(self, step):
         self.steps.append(step)
 
-    def get_topvar(self):
-        return self.env[-1] if self.env else None
+    def get_var(self, varname):
+        return self.env[varname] if varname in env else None
+
+    def set_var(self, varname, var):
+        self.env[varname] = var
 
     def execute(self):
         env = self.env
-        for step in self.steps:
-            f, *args = step
-            res_var = f(*args)
-            env.append(res_var)
-        return env[-1]
+        for f, in_varnames, out_varname in self.steps:
+            res = f(*map(self.get_var, in_varnames))
+            if out_varname:
+                self.set_var(out_varname, res)
+        return self.env['result']
 
-def plan_einsum(operands, nop_labels, output_labels, combined_labels, label_count):
+def reorder_ops(nop_axes):
+    nop = len(nop_axes)
+    ndim = len(nop_axes[0])
+    opis = list(range(nop))
+    perm = []
+
+    for i in range(ndim)[::-1]:
+        if not opis:
+            break
+        to_remove = [for opi in opis if nop_axes[opi][i] != -1]
+        for opi in to_remove:
+            perm.append(opi)
+            opis.remove(opi)
+
+    returm perm
+
+def plan_einsum(operands, nop_axes, all_labels, ndims_combine, label_count):
     '''
     Plans the actual execution steps.
 
@@ -523,38 +528,49 @@ def plan_einsum(operands, nop_labels, output_labels, combined_labels, label_coun
     -------
     the execution plan
     '''
+    combined_labels = all_labels[-ndims_combine:]
+    nop = len(operands)
 
     # Residual_labels holds the dimension labels on the intermediate result
-    prev_var_labels = ''
     prev_var_shape = []
+    prev_var_axes = []
     plan = Plan()
 
-    for var, var_labels in zip(operands, nop_labels):
+    # Check if there are dimensions ready to reduce, i.e. label_count == 1
+    for i in range(nop):
+        var = operands[i]
+
+        reduce_dims = []
+        for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
+            if label_count[j] == 1:
+                reduce_dims.append(dim)
+
+        if reduce_dims:
+            f = lambda: paddle.sum(var, reduce_dims)
+            step = [f, [], f'op{i}']
+            plan.add_step(step)
+
+    # Plan the summations over the operand sequence
+    for i, var_axes in zip(range(nop), operands, nop_axes):
         # plan a single step
-        # find which dimensions are ready to be combined or reduced
-        #    Relevant labels are those which are 1) not in output and 2) in this operand               
-        to_reduce, to_combine = []
+        to_combine = []
         var_shape = var.shape
         prev_var = plan.get_topvar()
-    
-        for l in combined_labels:
-            if label_count[l] == 1 and l in var_labels:
-                if l in prev_var_labels:
-                    to_combine.append(l)
-                else:
-                    to_reduce.append(l)
+        
+        # Step 1: re-arrange the dimensions of each op based on the global labels schema
+        # Step 1.1 transpose
+        perm = [dim for dim in var_axes if dim != -1]
+        f = lambda v: paddle.transpose(perm)
+        step = [f, [f'op{i}'], f'op{i}']
+        plan.add_step(step)
+        # Step 1.2 unsqueeze
+        fill = [i for i, d in enumerate(var_axes) if dim == -1]
+        f = lambda v: paddle.unsqueeze(v, fill)   
+        step = [f, [f'op{i}'], f'op{i}']
+        plan.add_step(step)
 
-        # There are dimensions to reduce
-        if to_reduce:
-            f = paddle.sum
-            axes = labels_to_axes(var_labels, to_reduce)
-            step = [f, var, axes]
-            plan.add_step(step)
-            # Remove these dimensions from the label string 
-            for l in to_reduce:
-                var_labels = var_labels.replace(l, '')
-            # Update var shape
-            var_shape = [s for i, s in enumerate(var_shape) if i not in axes]
+        if i == 1:
+            continue
 
         # We'd like to arrange the dimensions in the following way:
         # [B.... I...  J... K...]
@@ -569,16 +585,26 @@ def plan_einsum(operands, nop_labels, output_labels, combined_labels, label_coun
         #  (2) if J... not empty, K... not empty, then the summation can be turned into matmul
         #  (3) otherwise, make a broadcast *
 
-        # There are dimensions to fold
-        if to_combine:
-            # Distinguish dot and matmal
-            # dot if prev_var and var's shapes perfectly match on all labeled and broadcasting dims
-            #    we need axes to do the comparison
-            prev_var_axes_to_fold = labels_to_axes(prev_var_labels, to_fold)
-            var_axes_to_fold = labels_to_axes(var_labels, to_fold)
+        # Resolve the summation kind: dot, matmul or *
+        kind, *perms = summation_kind(prev_var_axs, var_axes, prev_var_shape, var_shape, to_combine)
+        if kind == 'dot':
+            I_perm, K_perm = *perms
+            step = make_transpose(prev_var, I_perm[0] + K_perm[0])
+            plan.add_step(step)
+            step = make_transpose(var, I_perm[1] + K_perm[1])
+            plan.add_step(step)
+            steps = make_dot(prev_var, var, len(I_perm[0]), len(K_perm[0]))
+            plan.add_steps(steps)
+        elif kind == 'matmul':
+            
+        else:
+            
             
         # Finally, update label count and pre_var's shape
         pre_var_shape
+    
+    # The last step is transpose and reshape, re-arranging the result dimensions to match the output labels
+    
 
 def einsum(equation, *operands):
     r"""
@@ -708,45 +734,43 @@ def einsum(equation, *operands):
     else:
         output_labels = infer_output_labels(nop_labels, n_bcast_dims)
 
+    # number of output dimensions
+    ndims_out = len(output_labels)
+
     # The rest labels need to be combined.
     combined_labels = label_count.keys()
     for l in output_labels:
         combined_labels.remove(l)
+    combined_labels = ''.join(combined_labels)
+
+    ndims_combined = len(combined_labels)
+    
+    # Reorder all_labels to be consistent 
+    all_labels = output_labels + combined_labels
+
+    # Label counters for combined labels
+    label_count = [label_count[l] for l in combined_labels]
+
+    # Build global_dims_index, a data structure that maintains the mapping from all_labels
+    # to the dimensions in the remained operands during the summation process.  
+    f = lambda labels: dims_index(labels, all_labels)
+    global_dims_index = list(map(f, nop_labels))
+
+    # Verify that all aligned dimensions are broadcastable in size across operands
+    verify_shape(global_dims_index)
+
+    # Reorder the operands and possibly reduce the summation complexity
+    perm = reorder_ops(global_dims_index)
+
+    operands = [operands[i] for i in perm]
+    nop_labels = [nop_labelsp[i] for i in perm]
+    global_dims_index = [global_dims_index[i] for i in perm]
 
     # Now we're ready to build up an execution plan
-    args = [operands, nop_labels, output_labels, combined_labels, label_count]
+    args = [operands, global_dims_index, all_labels, ndims_combined, label_count]
     plan = plan_einsum(*args)
     result = plan.execute()
 
     return result
 
 
-
-    # # Get the global label string, in which each and every label names each and every aligned dimension
-    # # e.g. '.ijk' for ['ij', 'i.', '.k']
-    # global_labelstr = gather_labels(nop_labels, n_bcast_dims)
-    # ndim = len(global_labelstr)
-
-
-
-    # # number of output dimensions
-    # ndim_out = len(output_labels)
-
-
-    # combined_labels = ''.join(combined)
-    # ndim_combined = len(combined_labels)
-    # assert ndim_combined + ndim_out == ndim
-
-    # # Reorder all_labels to be consistent 
-    # global_labelstr = combined_labels + output_labels
-
-    # # Build global_dims_index, a data structure that maintains the mapping from all_labels
-    # # to the dimensions in the remained operands during the summation process.  
-    # f = lambda labels: dims_index(labels, all_labels)
-    # global_dims_index = dict(zip(operands, map(f, nop_labels)))
-
-    # # Verify that all aligned dimensions are broadcastable in size across operands
-    # verify_shape(global_dims_index)
-
-
-    return z
