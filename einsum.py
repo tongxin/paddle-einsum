@@ -297,26 +297,30 @@ def diagonalize(labels, operand):
     'ijj...i' would be merged into 'ij...'
 
     '''
-    op_strides = dim_strides(operand.shape)
-    op_shape = operand.shape
-    new_op_labels = []
-    new_op_sizes = []
-    new_op_strides = []
-    
-    for i, l in enumerate(labels):
-        newi = new_op_labels.index(l)
-        if newi < 0 or l == '.':
+    if not has_duplicated_labels(labels):
+        return labels, operand
+
+    strides = dim_strides(operand.shape)
+    shape = operand.shape
+    new_labels = []
+    new_sizes = []
+    new_strides = []
+
+    for ax, l in enumerate(labels):
+        new_ax = new_labels.index(l)
+        if new_ax < 0 or l == '.':
             # not duplicate
-            new_op_labels.append(l)
-            new_op_strides.append(op_strides[i])
-            new_op_sizes.append(op_shape[i])
+            new_labels.append(l)
+            new_strides.append(strides[ax])
+            new_sizes.append(shape[ax])
         else:
             # duplicated label
-            new_op_strides[newi] += op_strides[i]
+            new_strides[new_ax] += strides[ax]
 
     # call framework API to build a new tensor
-    new_op = create_op_view(operand, new_op_sizes, new_op_strides)
-    return new_op, new_op_labels
+    new_op = create_op_view(operand, new_sizes, new_strides)
+    return new_labels, new_op
+
 
 def dims_index(in_labels, out_labels):
     '''
@@ -602,6 +606,7 @@ def plan_einsum(operands, nop_axes, ndims_combine, label_count):
         # Resolve the summation kind: dot, matmul or *
         plan_summation(plan, operands, nop_axes, nop_shapes, i-1, i, label_count)
 
+    return plan
 
 def einsum(equation, *operands):
     r"""
@@ -716,8 +721,7 @@ def einsum(equation, *operands):
     nop_labels, label_count = parse_and_count_labels(lhs, operands)
 
     # Diagonalize the operands which have duplicate labels
-    f = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
-    operands, nop_labels = list(zip(*map(f, nop_labels, operands)))
+    nop_labels, operands = list(zip(*map(diagonalize, nop_labels, operands)))
 
     # To handle broadcasting, we should first know how many dimensions are there
     # We need to use that number to generate output labels
