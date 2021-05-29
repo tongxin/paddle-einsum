@@ -104,7 +104,7 @@ def parse_output_labels(rhs, avail_labels, n_bcast_dims):
     The output labels in a string
     '''
     # Sanity check. Only alphabet is allowed if not '.'
-    assert all(c in avail_labels for c in rhs), f"Invalid equation: output labels must come from the input labels. "
+    assert all(c in avail_labels for c in rhs.replace('.', '')), f"Invalid equation: output labels must come from the input labels. "
 
     # Syntax check. Verify there's no duplicate alphabetical labels
     for i, l in enumerate(rhs.replace('.', '')):
@@ -368,21 +368,22 @@ def dims_index(in_labels, out_labels):
         s = re.search(r'\.+', in_labels)
         # fill the broadcast dimension indices from right to left.
         if s:
-            for ax, dim in zip(range(end, start, -1), range(s.end(), s.start(), -1)):
+            for ax, dim in zip(range(start, end)[::-1], range(s.start(), s.end())[::-1]):
                 inv_map[ax] = dim
         
     # Now work on non-broadcast dimensions 
-    if start:
+    if r:
         it = itertools.chain(range(start), range(end, len(out_labels)))
     else:
         it = iter(range(len(out_labels)))
-        
+
     for i in it:
         inv_map[i] = in_labels.find(out_labels[i])
 
     return inv_map
 
 def verify_shape(axes_list, operands):
+    print(axes_list)
     op_shapes = [op.shape for op in operands]
     for ax_dims in zip(*axes_list):
         # axes are a column of nop input dimension axes. -1 represents new axis
@@ -418,8 +419,17 @@ def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     '''
     # Transpose and re-shape op1 and op2 in I, J1, K and I, J2, K
     # Then apply matmul(x, y, transpose_x=False, tranpose_y=True)
-    perm1 = [op1_axes[ax] for ax in I + J1 + K]
-    perm2 = [op2_axes[ax] for ax in I + J2 + K]
+
+    # Note, I may index into -1
+    I1_dims = [op1_axes[ax] for ax in I if op1_axes[ax] >= 0]
+    I2_dims = [op2_axes[ax] for ax in I if op2_axes[ax] >= 0]
+    J1_dims = [op1_axes[ax] for ax in J1]
+    J2_dims = [op2_axes[ax] for ax in J2]
+    K1_dims = [op1_axes[ax] for ax in K]
+    K2_dims = [op2_axes[ax] for ax in K]
+
+    perm1 = I1_dims + J1_dims + K1_dims
+    perm2 = I2_dims + J2_dims + K2_dims
 
     print(f'perm1: {perm1}')
     print(f'perm2: {perm2}')    
@@ -431,7 +441,7 @@ def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     step = paddle.transpose, [var2], var2, perm2
     plan.add_step(step)
 
-    # Reshape and merge J and K into single dimensions
+    # Reshape by merging dimensions in J and K respectively
     for var, J, perm, shape in zip([var1, var2], [J1, J2], [perm1, perm2], [op1_shape, op2_shape]):
         new_shape = [shape[dim] for dim in perm]
         
@@ -451,9 +461,14 @@ def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
 
     # The result shape is in I..., J1, J2. Let's reshape back to known dimensions
     # Note, this is static deduction, not by reading the tensor shape at runtime
-    result_shape = [max(op1_shape[dim1], op2_shape[dim2]) for dim1, dim2 in zip(perm1[:len(I)], perm2[:len(I)])]
-    result_shape += [op1_shape[dim] for dim in perm1[len(I):-len(K)]]
-    result_shape += [op2_shape[dim] for dim in perm2[len(I):-len(K)]]
+    result_shape = [1] * len(I)
+    for ax in I:
+        dim1, dim2 = op1_axes[ax], op2_axes[ax]
+        s = 1 if dim1 < 0 else op1_shape[dim1]
+        s = s if dim2 < 0 else max(s, op2_shape[dim2])
+        result_shape[ax] = s
+    result_shape += [op1_shape[dim] for dim in J1_dims]
+    result_shape += [op2_shape[dim] for dim in J2_dims]
 
     step = paddle.reshape, [var2], var2, result_shape
     plan.add_step(step)
@@ -471,7 +486,7 @@ def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     for ax in J1 + J2:
         op2_axes[ax], dim = dim, dim+1
 
-def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, label_count):
+def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label_count):
     '''
     Plan various kinds of summation
     '''
@@ -484,10 +499,12 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, label_count):
 
     count = [0] * ndims_out + label_count
 
-    I, K, J1, J2 = [], [], [], []
+    I, K, J1, J2 = list(range(ndims_bcast)), [], [], []
     op1_reduce_axes, op2_reduce_axes = [], []
 
-    for ax, dim1, dim2 in zip(range(ndims), op1_axes, op2_axes):
+    for ax in range(ndims_bcast, ndims):
+        dim1, dim2 = op1_axes[ax], op2_axes[ax]
+
         if (dim1 != -1) != (dim2 != -1):
             if dim1 != -1:
                 J1.append(ax)
@@ -555,7 +572,7 @@ class Plan:
     def execute(self):
         res = None
         for f, in_varnames, out_varname, *args in self.steps:
-            
+            print(repr((out_varname, f, *in_varnames)))
             res = f(*map(self.get_var, in_varnames), *args)
             if out_varname:
                 self.set_var(out_varname, res)
@@ -577,7 +594,7 @@ def reorder_ops(nop_axes):
 
     return perm
 
-def plan_einsum(operands, nop_axes, ndims_combine, label_count):
+def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
     '''
     Plans the actual execution steps.
 
@@ -586,6 +603,7 @@ def plan_einsum(operands, nop_axes, ndims_combine, label_count):
     the execution plan
     '''
     nop_shapes = [list(op.shape) for op in operands]
+    ndims_combine = len(label_count)
     nop = len(operands)
 
     plan = Plan()
@@ -595,23 +613,24 @@ def plan_einsum(operands, nop_axes, ndims_combine, label_count):
     list(map(plan.set_var, op_names, operands))
 
     # Check if there are dimensions ready for reduce, i.e. label_count == 1
-    for i in range(nop):
-        var = f'op{i}'
-        reduce_dims = []
-        reduce_axes = []
-        for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
-            if label_count[j] == 1:
-                reduce_dims.append(dim)
-                reduce_axes.append(j)
-                label_count[j] = 0
+    if ndims_combine > 0:
+        for i in range(nop):
+            var = f'op{i}'
+            reduce_dims = []
+            reduce_axes = []
+            for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
+                if label_count[j] == 1:
+                    reduce_dims.append(dim)
+                    reduce_axes.append(j)
+                    label_count[j] = 0
 
-        if reduce_dims:
-            # Add reduce to the plan
-            step = paddle.sum, [var], var, reduce_dims
-            plan.add_step(step)
-            # Update axes index
-            for ax in reduce_axes:
-                nop_axes[ax] = -1
+            if reduce_dims:
+                # Add reduce to the plan
+                step = paddle.sum, [var], var, reduce_dims
+                plan.add_step(step)
+                # Update axes index
+                for ax in reduce_axes:
+                    nop_axes[ax] = -1
 
     # Plan the summations over the operand sequence
     for i in range(nop):
@@ -634,7 +653,7 @@ def plan_einsum(operands, nop_axes, ndims_combine, label_count):
         #  (3) otherwise, make a broadcast *
 
         # Resolve the summation kind: dot, matmul or *
-        plan_summation(plan, operands, nop_axes, nop_shapes, i-1, i, label_count)
+        plan_summation(plan, operands, nop_axes, nop_shapes, i-1, i, ndims_bcast, label_count)
 
     return plan
 
@@ -763,12 +782,16 @@ def einsum(equation, *operands):
     else:
         output_labels = infer_output_labels(label_count, n_bcast_dims)
 
+    print(f'output_labels:  {output_labels}')
+
     # The rest labels need to be combined.
     to_remove = [l for l in label_count.keys() if l in output_labels]
     for l in to_remove:
         label_count.pop(l)
 
     combined_labels = ''.join(label_count.keys())
+
+    print(f'combined_labels:  {combined_labels}')
 
     ndims_combined = len(combined_labels)
     
@@ -777,6 +800,8 @@ def einsum(equation, *operands):
 
     # Label counters for combined labels
     label_count = [label_count[l] for l in combined_labels]
+
+    print(label_count)
 
     # Build global_dims_index, a data structure that maintains the mapping from all_labels
     # to the dimensions in the remained operands during the summation process.  
@@ -794,7 +819,7 @@ def einsum(equation, *operands):
     global_dims_index = [global_dims_index[i] for i in perm]
 
     # Now we're ready to build up an execution plan
-    args = [operands, global_dims_index, ndims_combined, label_count]
+    args = [operands, global_dims_index, n_bcast_dims, label_count]
     plan = plan_einsum(*args)
     result = plan.execute()
 
@@ -802,11 +827,14 @@ def einsum(equation, *operands):
 
 if __name__ == '__main__':
     import numpy as np
-    
-    x = np.random.randn(5, 2)
-    y = np.random.randn(5, 3, 2)
+
+    x = np.random.randn(5, 1, 10000)
+    y = np.random.randn(100, 10000)
 
     tx = paddle.to_tensor(x)
     ty = paddle.to_tensor(y)
 
-    einsum('ij, i...j', tx, ty)
+    equation = '...k, ...k -> ...k'
+
+    np_res = np.einsum(equation, x, y)
+    pd_res = einsum(equation, tx, ty)
