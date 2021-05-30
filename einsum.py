@@ -405,13 +405,16 @@ def plan_reduce(plan, op, op_axes, op_shape, reduce_axes):
     '''
     varname = f'op{op}'
     reduce_dims = [op_axes[ax] for ax in reduce_axes]
-    step = paddle.sum, [varname], varname, reduce_dims
+    f = lambda var, reduce_dims: paddle.sum(var, reduce_dims, keepdim=True)
+    step = f, [varname], varname, reduce_dims
     plan.add_step(step)
     # Update axes index
-    for ax in reduce_axes:
-        op_axes[ax] = -1
+    # for ax in reduce_axes:
+    #     op_axes[ax] = -1
+    # for dim in reduce_dims:
+        # op_shape.pop(dim)
     for dim in reduce_dims:
-        op_shape.pop(dim)
+        op_shape[dim] = 1
 
 def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K):
     '''
@@ -517,9 +520,8 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
                         op1_reduce_axes.append(ax)
                     else:
                         op2_reduce_axes.append(ax)
-                else:
-                    K.append(ax)
                 # Either case, kill this axis
+                K.append(ax)
                 count[ax] = 0   
             else:
                 I.append(ax)
@@ -535,7 +537,7 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
         plan_reduce(plan, op1, op1_axes, op1_shape, op1_reduce_axes)
         
     if op2_reduce_axes:
-        plan_reduce(plan, op2, op2_axes, op2_shape, op1_reduce_axes)
+        plan_reduce(plan, op2, op2_axes, op2_shape, op2_reduce_axes)
 
     # Now it's OK to merge the K dims as the same shape holds
     print(f'I: {I}   J1: {J1}    J2: {J2}   K: {K}')
@@ -623,6 +625,7 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
     '''
     nop = len(operands)
     ndims_combine = len(label_count)
+    ndims_out = len(nop_axes[0]) - ndims_combine
 
     # Initialize a plan with an environment
     plan = Plan()
@@ -637,22 +640,16 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
 
     # Check if there are dimensions ready for reduce, i.e. label_count == 1
     for i in range(nop):
-        var = f'op{i}'
         reduce_dims = []
         reduce_axes = []
         for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
             if label_count[j] == 1:
                 reduce_dims.append(dim)
-                reduce_axes.append(j)
+                reduce_axes.append(ndims_out+j)
                 label_count[j] = 0
 
         if reduce_dims:
-            # Add reduce to the plan
-            step = paddle.sum, [var], var, reduce_dims
-            plan.add_step(step)
-            # Update axes index
-            for ax in reduce_axes:
-                nop_axes[ax] = -1
+            plan_reduce(plan, i, nop_axes[i], nop_shapes[i], reduce_axes)
 
     # Plan the summations over the operand sequence
     for i in range(nop):
@@ -856,7 +853,14 @@ if __name__ == '__main__':
     tx = paddle.to_tensor(x)
     ty = paddle.to_tensor(y)
 
-    equation = '...k, ...k -> ...k'
+    equations = [               \
+        'ijk, jk',              \
+        '...k, ...k->...k',     \
+        'ij..., j...'           \
+        'ij..., j...->...'      \
+    ]
 
-    np_res = np.einsum(equation, x, y)
-    pd_res = einsum(equation, tx, ty)
+    # np_res = np.einsum(equation, x, y)
+
+    for eqn in equations:
+        einsum(eqn, tx, ty).shape
