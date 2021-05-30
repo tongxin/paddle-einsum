@@ -490,7 +490,6 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
     '''
     Plan various kinds of summation
     '''
-
     op1_axes, op2_axes = [nop_axes[op] for op in (op1, op2)]
     op1_shape, op2_shape = [nop_shapes[op] for op in (op1, op2)]
 
@@ -544,6 +543,26 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
     # Plan different versions of matmul based on the the shape of I, J, K
     plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
 
+def plan_broadcast(plan, operands, nop_axes, ndims_bcast):
+    '''
+    Plan broadcast across
+    '''
+    nop = len(operands)
+    varnames = [f'op{i}' for i in range(nop)]
+
+    for i, op, op_axes in zip(range(nop), operands, nop_axes):
+        perm = [dim for dim in op_axes if dim >= 0]        
+        var = varnames[i]
+        step = paddle.transpose, [var], var, perm
+        plan.add_step(step)
+
+    def f(*args):
+        expr = ' * '.join(varnames)
+        return eval(expr, dict(zip(varnames, args)))
+
+    step = f, varnames, None
+    plan.add_step(step)
+
 def labels_to_axes(labelstr, labels):
     return [i for i, l in enumerate(labelstr) if l in labels]
 
@@ -572,7 +591,7 @@ class Plan:
     def execute(self):
         res = None
         for f, in_varnames, out_varname, *args in self.steps:
-            print(repr((out_varname, f, *in_varnames)))
+            print(repr((out_varname, f, *in_varnames, *args)))
             res = f(*map(self.get_var, in_varnames), *args)
             if out_varname:
                 self.set_var(out_varname, res)
@@ -602,35 +621,38 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
     -------
     the execution plan
     '''
-    nop_shapes = [list(op.shape) for op in operands]
-    ndims_combine = len(label_count)
     nop = len(operands)
+    ndims_combine = len(label_count)
 
+    # Initialize a plan with an environment
     plan = Plan()
-
-    # Initialize the plan's environment with the input operands
     op_names = [f'op{i}' for i in range(nop)]
     list(map(plan.set_var, op_names, operands))
+    nop_shapes = [list(op.shape) for op in operands]
+
+    # In case no dimensions to combine, do broadcast straight
+    if not ndims_combine:
+        plan_broadcast(plan, operands, nop_axes, ndims_bcast)
+        return plan
 
     # Check if there are dimensions ready for reduce, i.e. label_count == 1
-    if ndims_combine > 0:
-        for i in range(nop):
-            var = f'op{i}'
-            reduce_dims = []
-            reduce_axes = []
-            for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
-                if label_count[j] == 1:
-                    reduce_dims.append(dim)
-                    reduce_axes.append(j)
-                    label_count[j] = 0
+    for i in range(nop):
+        var = f'op{i}'
+        reduce_dims = []
+        reduce_axes = []
+        for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
+            if label_count[j] == 1:
+                reduce_dims.append(dim)
+                reduce_axes.append(j)
+                label_count[j] = 0
 
-            if reduce_dims:
-                # Add reduce to the plan
-                step = paddle.sum, [var], var, reduce_dims
-                plan.add_step(step)
-                # Update axes index
-                for ax in reduce_axes:
-                    nop_axes[ax] = -1
+        if reduce_dims:
+            # Add reduce to the plan
+            step = paddle.sum, [var], var, reduce_dims
+            plan.add_step(step)
+            # Update axes index
+            for ax in reduce_axes:
+                nop_axes[ax] = -1
 
     # Plan the summations over the operand sequence
     for i in range(nop):
