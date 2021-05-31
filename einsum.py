@@ -545,6 +545,19 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
     # Plan different versions of matmul based on the the shape of I, J, K
     plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
 
+def rearrange(axes):
+    perm, fill = [], []
+    for ax, dim in enumerate(axes):
+        if dim < 0:
+            fill.append(ax)
+        else:
+            perm.append(dim)
+    # Trivial permutation returns []
+    if all(i == dim for i, dim in enumerate(perm)):
+        perm = []
+    
+    return perm, fill
+
 def plan_broadcast(plan, operands, nop_axes, ndims_bcast):
     '''
     Plan broadcast across
@@ -552,11 +565,16 @@ def plan_broadcast(plan, operands, nop_axes, ndims_bcast):
     nop = len(operands)
     varnames = [f'op{i}' for i in range(nop)]
 
-    for i, op, op_axes in zip(range(nop), operands, nop_axes):
-        perm = [dim for dim in op_axes if dim >= 0]        
+    for i, op_axes in zip(range(nop), nop_axes):
+        # Re-arrange the dimesions according to the global layout
+        perm, fill = rearrange(op_axes)
         var = varnames[i]
-        step = paddle.transpose, [var], var, perm
-        plan.add_step(step)
+        if perm:
+            step = paddle.transpose, [var], var, perm
+            plan.add_step(step)
+        if fill:
+            step = paddle.unsqueeze, [var], var, fill
+            plan.add_step(step)
 
     def f(*args):
         expr = ' * '.join(varnames)
