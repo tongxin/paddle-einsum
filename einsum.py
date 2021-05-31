@@ -398,30 +398,58 @@ def verify_shape(axes_list, operands):
         for s1, s2, ax1, ax2, op1, op2 in zip(sizes, sizes[1:], op_dims, op_dims[1:], ops, ops[1:]):
             assert s1 == s2, f'Dimension {ax1} in {op1.name} and dimension {ax2} in {op2.name} do not match in size.'
 
+def plan_squeeze(plan, op, op_axes, op_shape, squeeze_axes):
+    varname = f'op{op}'
+    squeeze_dims = []
+
+    # Update axes and reset mappings for squeezed dims
+    for ax in squeeze_axes:
+        dim = op_axes[ax]
+        squeeze_dims.append(dim)
+        for i, d in enumerate(op_axes):
+            if d > dim:
+                op_axes[i] -= 1
+        op_axes[ax] = -1
+        op_shape.pop(dim)
+    # Be aware that the op label string is not updated yet...
+
+    step = paddle.squeeze, [varname], varname, squeeze_dims
+    plan.add_step(step)
 
 def plan_reduce(plan, op, op_axes, op_shape, reduce_axes):
     '''
     Add reduce to the plan
     '''
     varname = f'op{op}'
-    reduce_dims = [op_axes[ax] for ax in reduce_axes]
-    f = lambda var, reduce_dims: paddle.sum(var, reduce_dims, keepdim=True)
-    step = f, [varname], varname, reduce_dims
-    plan.add_step(step)
-    # Update axes index
-    # for ax in reduce_axes:
-    #     op_axes[ax] = -1
-    # for dim in reduce_dims:
-        # op_shape.pop(dim)
-    for dim in reduce_dims:
-        op_shape[dim] = 1
+    reduce_dims = []
 
-def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K):
+    # Update axes and reset mappings for squeezed dims
+    for ax in reduce_axes:
+        dim = op_axes[ax]
+        reduce_dims.append(dim)
+        for i, d in enumerate(op_axes):
+            if d > dim:
+                op_axes[i] -= 1
+        op_axes[ax] = -1
+        op_shape.pop(dim)
+    # Be aware that the op label string is not updated yet...
+
+    step = paddle.sum, [varname], varname, reduce_dims
+    plan.add_step(step)
+
+def plan_scalar_prod(plan, operands, op1, op2):    
+    varnames = [f'op{op1}', f'op{op2}']
+    f = lambda var1, var2: var1 * var2
+    step = f, varnames, varnames[1]
+    plan.add_step(step)
+
+def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K):
     '''
     plan matmul
     '''
     # Transpose and re-shape op1 and op2 in I, J1, K and I, J2, K
     # Then apply matmul(x, y, transpose_x=False, tranpose_y=True)
+    var1, var2 = f'op{op1}', f'op{op2}'
 
     # Note, I may index into -1
     I1_dims = [op1_axes[ax] for ax in I if op1_axes[ax] >= 0]
@@ -433,19 +461,34 @@ def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
 
     perm1 = I1_dims + J1_dims + K1_dims
     perm2 = I2_dims + J2_dims + K2_dims
+    
+    if any(i != dim for i, dim in enumerate(perm1)):
+        print(f'perm1: {perm1}')
+        step = paddle.transpose, [var1], var1, perm1
+        plan.add_step(step)
+        # update axes index
+        for i, dim in enumerate(op1_axes):
+            if dim > 0:
+                new_dim = perm1.index(dim)
+                op1_axes[i] = new_dim
 
-    print(f'perm1: {perm1}')
-    print(f'perm2: {perm2}')    
+    if any(i != dim for i, dim in enumerate(perm2)):
+        print(f'perm2: {perm2}')
+        step = paddle.transpose, [var2], var2, perm2
+        plan.add_step(step)
+        # update axes index
+        for i, dim in enumerate(op2_axes):
+            if dim > 0:
+                new_dim = perm2.index(dim)
+                op2_axes[i] = new_dim
 
-    var1, var2 = f'op{op1}', f'op{op2}'
-    step = paddle.transpose, [var1], var1, perm1
-    plan.add_step(step)
-
-    step = paddle.transpose, [var2], var2, perm2
-    plan.add_step(step)
-
-    # Reshape by merging dimensions in J and K respectively
-    for var, J, perm, shape in zip([var1, var2], [J1, J2], [perm1, perm2], [op1_shape, op2_shape]):
+    # As a preparation for matmul, merge multiple dimensions in J and in K
+    # If I is empty, meaning no batching is needed, then matmul does vector-vector,
+    # matrix-vector and matrix-matrix multiplies, depending on the two operand's shapes.
+    # In this case (I is []), we don't create a dummy J dimension if J is empty.
+    # However if K is empty we need to expand an extra dimension of size 1 for K.
+    tmp = [var1, J1, perm1, op1_shape], [var2, J2, perm2, op2_shape]
+    for var, J, perm, shape in tmp:
         new_shape = [shape[dim] for dim in perm]
         
         K_size, J_size = 1, 1
@@ -470,9 +513,14 @@ def plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
         s = 1 if dim1 < 0 else op1_shape[dim1]
         s = s if dim2 < 0 else max(s, op2_shape[dim2])
         result_shape[ax] = s
-    result_shape += [op1_shape[dim] for dim in J1_dims]
-    result_shape += [op2_shape[dim] for dim in J2_dims]
+    if J1:
+        result_shape += [op1_shape[dim] for dim in J1_dims]
+    if J2:
+        result_shape += [op2_shape[dim] for dim in J2_dims]
 
+    # Need a scalar dimension somehow
+    if not result_shape:
+        result_shape = [1]
     step = paddle.reshape, [var2], var2, result_shape
     plan.add_step(step)
 
@@ -502,7 +550,6 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
     count = [0] * ndims_out + label_count
 
     I, K, J1, J2 = list(range(ndims_bcast)), [], [], []
-    op1_reduce_axes, op2_reduce_axes = [], []
 
     for ax in range(ndims_bcast, ndims):
         dim1, dim2 = op1_axes[ax], op2_axes[ax]
@@ -514,13 +561,7 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
                 J2.append(ax)
         elif dim1 != -1:
             if count[ax] == 2:
-                shape = op1_shape[dim1], op2_shape[dim2]
-                if shape[0] != shape[1]:
-                    if shape[0] != 1:
-                        op1_reduce_axes.append(ax)
-                    else:
-                        op2_reduce_axes.append(ax)
-                # Either case, kill this axis
+                # kill this axis
                 K.append(ax)
                 count[ax] = 0   
             else:
@@ -529,21 +570,11 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
                 if ax >= ndims_out:
                     label_count[ax - ndims_out] -= 1
 
-    # Reduce the K dimensions
-    # Two side effects caused by the reduce's:
-    #   1) the killed dims will be replaced with -1 in the axes array,
-    #   2) the shape array will be shrinked 
-    if op1_reduce_axes:
-        plan_reduce(plan, op1, op1_axes, op1_shape, op1_reduce_axes)
-        
-    if op2_reduce_axes:
-        plan_reduce(plan, op2, op2_axes, op2_shape, op2_reduce_axes)
-
     # Now it's OK to merge the K dims as the same shape holds
     print(f'I: {I}   J1: {J1}    J2: {J2}   K: {K}')
 
     # Plan different versions of matmul based on the the shape of I, J, K
-    plan_matmal(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
+    plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
 
 def rearrange(axes):
     perm, fill = [], []
@@ -651,17 +682,27 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
     list(map(plan.set_var, op_names, operands))
     nop_shapes = [list(op.shape) for op in operands]
 
-    # In case no dimensions to combine, do broadcast straight
+    # In case no dimensions to combine, do broadcast straight across
     if not ndims_combine:
         plan_broadcast(plan, operands, nop_axes, ndims_bcast)
         return plan
 
-    # Check if there are dimensions ready for reduce, i.e. label_count == 1
+    # Canonicalize by removing size-1 to-combine dimensions
+    for i, op_axes, shape in zip(range(nop), nop_axes, nop_shapes):
+        squeeze_axes = []
+        for j, dim in enumerate(op_axes[-ndims_combine:]):
+            if shape[dim] == 1:
+                squeeze_axes.append(ndims_out+j)
+                label_count[j] -= 1
+        if squeeze_axes:
+            plan_squeeze(plan, i, nop_axes[i], nop_shapes[i], squeeze_axes)
+
+    # Reduce dimensions whose label_count == 1
     for i in range(nop):
         reduce_dims = []
         reduce_axes = []
         for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
-            if label_count[j] == 1:
+            if dim >= 0 and label_count[j] == 1:
                 reduce_dims.append(dim)
                 reduce_axes.append(ndims_out+j)
                 label_count[j] = 0
@@ -690,7 +731,11 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
         #  (3) otherwise, make a broadcast *
 
         # Resolve the summation kind: dot, matmul or *
-        plan_summation(plan, operands, nop_axes, nop_shapes, i-1, i, ndims_bcast, label_count)
+        if not nop_shapes[i-1]:
+            # op1 is a scalar
+            plan_scalar_prod(plan, operands, i-1, i)
+        else:
+            plan_summation(plan, operands, nop_axes, nop_shapes, i-1, i, ndims_bcast, label_count)
 
     return plan
 
@@ -799,7 +844,8 @@ def einsum(equation, *operands):
     lhs, *rhs = equation.split('->')
 
     assert len(rhs) < 2, "Invalid equation: multiple `->` were found."
-    rhs = rhs[0] if rhs else ''
+    # Note, we distinguish between 'ij->' and 'ij' by setting rhs to '' and None
+    rhs = rhs[0] if rhs else None
 
     # Parse labels for each operand and count the number of occurrences for each alphabet label
     nop_labels, label_count = parse_and_count_labels(lhs, operands)
@@ -814,24 +860,22 @@ def einsum(equation, *operands):
 
     # Parse or infer output labels. The broadcasting dimensions should be taken care of.
     # Following the Numpy's rule, the broadcasting dimensions must be present in the output. 
-    if rhs:
-        output_labels = parse_output_labels(rhs, list(label_count.keys()), n_bcast_dims)
-    else:
+    if rhs is None:
         output_labels = infer_output_labels(label_count, n_bcast_dims)
+    else:
+        output_labels = parse_output_labels(rhs, list(label_count.keys()), n_bcast_dims)
 
     print(f'output_labels:  {output_labels}')
 
     # The rest labels need to be combined.
-    to_remove = [l for l in label_count.keys() if l in output_labels]
-    for l in to_remove:
-        label_count.pop(l)
+    for l in output_labels:
+        if l in label_count:
+            label_count.pop(l)
 
     combined_labels = ''.join(label_count.keys())
-
-    print(f'combined_labels:  {combined_labels}')
-
-    ndims_combined = len(combined_labels)
     
+    print(f'labels to combine:  {combined_labels}')
+
     # Reorder all_labels to be consistent 
     all_labels = output_labels + combined_labels
 
@@ -874,18 +918,27 @@ if __name__ == '__main__':
     equations = [               \
         'ijk, jk',              \
         '...k, ...k->...k',     \
-        'ij..., j...'           \
+        'ij..., j...',          \
         'ij..., j...->...'      \
     ]
+
+    for eqn in equations:
+        print(einsum(eqn, tx, ty))
 
     np.random.seed(102)
 
     tx = paddle.to_tensor(np.random.rand(4))
     ty = paddle.to_tensor(np.random.rand(5))
 
-    # np_res = np.einsum(equation, x, y)
-    equations = [
-        "i,j->ij"
+    equations =[
+        'i,i->'
     ]
     for eqn in equations:
-        einsum(eqn, tx, ty).shape
+        print(einsum(eqn, tx, tx))
+
+    equations = [
+        'i,j->ij',
+        'i,j->'
+    ]
+    for eqn in equations:
+        print(einsum(eqn, tx, ty))
