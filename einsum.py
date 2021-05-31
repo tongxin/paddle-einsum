@@ -116,7 +116,7 @@ def parse_output_labels(rhs, avail_labels, n_bcast_dims):
         f"Invalid equation: `.` is only expected to be included in an ellipsis."
     
     # Check if ellipsis is missing
-    assert n_bcast_dims > 0 == rhs.find('...') >= 0, \
+    assert (n_bcast_dims > 0) == (rhs.find('...') >= 0), \
         f"Invalid equation: there are broadcasting dimensions yet found no '...' in the output labels."
 
     out_labels = rhs.replace('...', '.' * n_bcast_dims, 1) if n_bcast_dims > 0 else rhs
@@ -860,7 +860,14 @@ if __name__ == '__main__':
         'ij..., j...->...'      \
     ]
 
-    # np_res = np.einsum(equation, x, y)
+    np.random.seed(102)
 
+    tx = paddle.to_tensor(np.random.rand(4))
+    ty = paddle.to_tensor(np.random.rand(5))
+
+    # np_res = np.einsum(equation, x, y)
+    equations = [
+        "i,j->ij"
+    ]
     for eqn in equations:
         einsum(eqn, tx, ty).shape
