@@ -483,28 +483,33 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
                 new_dim = perm2.index(dim)
                 op2_axes[i] = new_dim
 
+    # In case only I exists, simply do a broadcast
+    if I and not J1 and not J2 and not K:
+        step = paddle.multiply, [var1, var2], var2
+        plan.add_step(step)
+    else:
     # As a preparation for matmul, merge multiple dimensions in J and in K
     # If I is empty, meaning no batching is needed, then matmul does vector-vector,
     # matrix-vector and matrix-matrix multiplies, depending on the two operand's shapes.
     # In this case (I is []), we don't create a dummy J dimension if J is empty.
     # However if K is empty we need to expand an extra dimension of size 1 for K.
-    tmp = [var1, J1, perm1, op1_shape], [var2, J2, perm2, op2_shape]
-    for var, J, perm, shape in tmp:
-        new_shape = [shape[dim] for dim in perm]
+        tmp = [var1, J1, perm1, op1_shape], [var2, J2, perm2, op2_shape]
+        for var, J, perm, shape in tmp:
+            new_shape = [shape[dim] for dim in perm]
         
-        K_size, J_size = 1, 1
-        for _ in K:
-            K_size *= new_shape.pop()
-        for _ in J:
-            J_size *= new_shape.pop()
+            K_size, J_size = 1, 1
+            for _ in K:
+                K_size *= new_shape.pop()
+            for _ in J:
+                J_size *= new_shape.pop()
 
-        new_shape += [J_size, K_size]
-        step = paddle.reshape, [var], var, new_shape
+            new_shape += [J_size, K_size]
+            step = paddle.reshape, [var], var, new_shape
+            plan.add_step(step)
+
+        # Matmul
+        step = paddle.matmul, [var1, var2], var2, False, True
         plan.add_step(step)
-
-    # Matmul
-    step = paddle.matmul, [var1, var2], var2, False, True
-    plan.add_step(step)
 
     # The result shape is in I..., J1, J2. Let's reshape back to known dimensions
     # Note, this is static deduction, not by reading the tensor shape at runtime
@@ -592,7 +597,7 @@ def rearrange(axes):
     
     return perm, fill
 
-def plan_broadcast(plan, operands, nop_axes, ndims_bcast):
+def plan_broadcast(plan, operands, nop_axes):
     '''
     Plan broadcast across
     '''
@@ -676,8 +681,9 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
     the execution plan
     '''
     nop = len(operands)
+    ndims = len(nop_axes[0])
     ndims_combine = len(label_count)
-    ndims_out = len(nop_axes[0]) - ndims_combine
+    ndims_out = ndims - ndims_combine
 
     # Initialize a plan with an environment
     plan = Plan()
@@ -687,30 +693,29 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
 
     # In case no dimensions to combine, do broadcast straight across
     if not ndims_combine:
-        plan_broadcast(plan, operands, nop_axes, ndims_bcast)
+        plan_broadcast(plan, operands, nop_axes)
         return plan
 
     # Canonicalize by removing size-1 to-combine dimensions
     for i, op_axes, shape in zip(range(nop), nop_axes, nop_shapes):
         squeeze_axes = []
-        for j, dim in enumerate(op_axes[-ndims_combine:]):
+        for j in range(ndims_out, ndims):
+            dim = op_axes[j]
             if shape[dim] == 1:
-                squeeze_axes.append(ndims_out+j)
-                label_count[j] -= 1
+                squeeze_axes.append(j)
+                label_count[j-ndims_out] -= 1
         if squeeze_axes:
             plan_squeeze(plan, i, nop_axes[i], nop_shapes[i], squeeze_axes)
 
     # Reduce dimensions whose label_count == 1
-    for i in range(nop):
-        reduce_dims = []
+    for i, op_axes in enumerate(nop_axes):
         reduce_axes = []
-        for j, dim in enumerate(nop_axes[i][-ndims_combine:]):
-            if dim >= 0 and label_count[j] == 1:
-                reduce_dims.append(dim)
-                reduce_axes.append(ndims_out+j)
-                label_count[j] = 0
-
-        if reduce_dims:
+        for j in range(ndims_out, ndims):
+            dim = op_axes[j]
+            if dim >= 0 and label_count[j-ndims_out] == 1:
+                reduce_axes.append(j)
+                label_count[j-ndims_out] = 0
+        if reduce_axes:
             plan_reduce(plan, i, nop_axes[i], nop_shapes[i], reduce_axes)
 
     # Plan the summations over the operand sequence
