@@ -383,7 +383,8 @@ def dims_index(in_labels, out_labels):
     return inv_map
 
 def verify_shape(axes_list, operands):
-    print(axes_list)
+    for axes in axes_list:
+        print(axes)
     op_shapes = [op.shape for op in operands]
     for ax_dims in zip(*axes_list):
         # axes are a column of nop input dimension axes. -1 represents new axis
@@ -573,8 +574,10 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
     # Now it's OK to merge the K dims as the same shape holds
     print(f'I: {I}   J1: {J1}    J2: {J2}   K: {K}')
 
-    # Plan different versions of matmul based on the the shape of I, J, K
-    plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
+    if not I and not J1 and not J2 and K:
+        plan_dot(plan, )
+    else:
+        plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
 
 def rearrange(axes):
     perm, fill = [], []
@@ -865,7 +868,7 @@ def einsum(equation, *operands):
     else:
         output_labels = parse_output_labels(rhs, list(label_count.keys()), n_bcast_dims)
 
-    print(f'output_labels:  {output_labels}')
+    print(f'equation:   {equation}')
 
     # The rest labels need to be combined.
     for l in output_labels:
@@ -874,15 +877,17 @@ def einsum(equation, *operands):
 
     combined_labels = ''.join(label_count.keys())
     
-    print(f'labels to combine:  {combined_labels}')
 
     # Reorder all_labels to be consistent 
     all_labels = output_labels + combined_labels
 
+    print(f'labels => output: {output_labels}   combine: {combined_labels}')
+
+
     # Label counters for combined labels
     label_count = [label_count[l] for l in combined_labels]
 
-    print(label_count)
+    print(f'label count:  {label_count}')
 
     # Build global_dims_index, a data structure that maintains the mapping from all_labels
     # to the dimensions in the remained operands during the summation process.  
