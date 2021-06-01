@@ -459,6 +459,9 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     J2_dims = [op2_axes[ax] for ax in J2]
     K1_dims = [op1_axes[ax] for ax in K]
     K2_dims = [op2_axes[ax] for ax in K]
+    I1_shape, J1_shape, K1_shape = [[op1_shape[dim] for dim in dims] for dims in (I1_dims, J1_dims, K1_dims)]
+    I2_shape, J2_shape, K2_shape = [[op2_shape[dim] for dim in dims] for dims in (I2_dims, J2_dims, K2_dims)]
+    K1_size = sum(K1_shape)
 
     perm1 = I1_dims + J1_dims + K1_dims
     perm2 = I2_dims + J2_dims + K2_dims
@@ -483,29 +486,48 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
                 new_dim = perm2.index(dim)
                 op2_axes[i] = new_dim
 
-    # In case only I exists, simply do a broadcast
-    if I and not J1 and not J2 and not K:
+    # In case no K... dimensions remain, do a broadcast
+    if not K:
+        # unsqueeze operands include J1...J2... dimensions
+        if J2:
+            fill_start = len(I2_dims) + len(J1)
+            fill_end = fill_start + len(J2)
+            fill = list(range(fill_start, fill_end))
+            step = paddle.unsqueeze, [var1], var1, fill
+            plan.add_step(step)
+        if J1:
+            fill_start = len(I2_dims)
+            fill_end = fill_start + len(J1)
+            fill = list(range(fill_start, fill_end))
+            step = paddle.unsqueeze, [var2], var2, fill
+            plan.add_step(step)
+        # make broadcast
         step = paddle.multiply, [var1, var2], var2
         plan.add_step(step)
+    # K... are there, let's reason about I... and J...
+    # In case I... and J... are empty, do the vector-vector version of matmul
+    elif not I and not J1 and not J2:
+        # merge K dimensions
+        if len(K) > 1:
+            for var in var1, var2:
+                step = paddle.reshape, [var], var, [K1_size]
+                plan.add_step(step)
+        # Build vector-vector matmul
+        step = paddle.matmul, [var1, var2], var2
+        plan.add_step(step)
+    # General case, there are K... and some I... and J..., the actual operation will be 
+    # matrix-vector or matrix-matrix multiplies, depending on the operands' shapes.
     else:
-    # As a preparation for matmul, merge multiple dimensions in J and in K
-    # If I is empty, meaning no batching is needed, then matmul does vector-vector,
-    # matrix-vector and matrix-matrix multiplies, depending on the two operand's shapes.
-    # In this case (I is []), we don't create a dummy J dimension if J is empty.
-    # However if K is empty we need to expand an extra dimension of size 1 for K.
-        tmp = [var1, J1, perm1, op1_shape], [var2, J2, perm2, op2_shape]
-        for var, J, perm, shape in tmp:
-            new_shape = [shape[dim] for dim in perm]
-        
-            K_size, J_size = 1, 1
-            for _ in K:
-                K_size *= new_shape.pop()
-            for _ in J:
-                J_size *= new_shape.pop()
+        # Merge J dims and K dims by reshaping
+        merged_shape1 = I1_shape + [sum(J1_shape)] + [sum(K1_shape)]
+        merged_shape1 = [1 if size == 0 else size for size in merged_shape1]
+        merged_shape2 = I2_shape + [sum(J2_shape)] + [sum(K2_shape)]
+        merged_shape2 = [1 if size == 0 else size for size in merged_shape2]
 
-            new_shape += [J_size, K_size]
-            step = paddle.reshape, [var], var, new_shape
-            plan.add_step(step)
+        step = paddle.reshape, [var1], var1, merged_shape1
+        plan.add_step(step)
+        step = paddle.reshape, [var2], var2, merged_shape2
+        plan.add_step(step)
 
         # Matmul
         step = paddle.matmul, [var1, var2], var2, False, True
@@ -520,20 +542,19 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
         s = s if dim2 < 0 else max(s, op2_shape[dim2])
         result_shape[ax] = s
     if J1:
-        result_shape += [op1_shape[dim] for dim in J1_dims]
+        result_shape += J1_shape
     if J2:
-        result_shape += [op2_shape[dim] for dim in J2_dims]
+        result_shape += J2_shape
 
     # Need a scalar dimension somehow
-    if not result_shape:
-        result_shape = [1]
-    step = paddle.reshape, [var2], var2, result_shape
-    plan.add_step(step)
+    if result_shape:
+        step = paddle.reshape, [var2], var2, result_shape
+        plan.add_step(step)
 
     # Wrap up, updating auxiliary data
     op2_shape.clear()
     for s in result_shape:
-        op2_shape.append(s) 
+        op2_shape.append(s)
 
     for ax in range(len(op2_axes)):
         op2_axes[ax] = -1
@@ -579,10 +600,7 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
     # Now it's OK to merge the K dims as the same shape holds
     print(f'I: {I}   J1: {J1}    J2: {J2}   K: {K}')
 
-    if not I and not J1 and not J2 and K:
-        plan_dot(plan, )
-    else:
-        plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
+    plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
 
 def rearrange(axes):
     perm, fill = [], []
@@ -726,20 +744,23 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
             continue
 
         # We'd like to arrange the dimensions in the following way:
-        # [B.... I...  J... K...]
-        # [B.... I...  J... K...]
-        # where B... represents broadcasting dimensions, 
-        #       I... label matched and not yet to be combined dimensions, both output and not output
-        #       J... label not matched dimensions and output dimensions
-        #       K... label matched and should immediately combined dimensions
-        # We then inspect the layout and see if the summation can be specialized.  
-        # Current specialization schemes:
-        #  (1) if B... I... K... not empty, and J... empty, then the summation can be turned into dot
-        #  (2) if J... not empty, K... not empty, then the summation can be turned into matmul
-        #  (3) otherwise, make a broadcast *
+        # [I...  J... K...]
+        # [I...  J... K...]
+        # where  
+        #       I... are aligned and not to be combined immediately 
+        #       J... are not aligned and not to be combined immediately
+        #       K... are aligned and should be immediately combined
+        # At this point the non-trivial broadcast dimensinos in K are already reduced
+        # and removed. That means all K dimensions are aligned and their sizes are not 1.
+        # We then inspect the layout of I,J,K plus the above observation to make
+        # specializatoin decisions.  The current strategy is set as follows:
+        #  (1) if I... J... K... are all empty, it's multiplying a scalar
+        #  (2) if K... are empty, better use a broadcast
+        #  (3) if I... J... empty and K... not empty, a vector-vector multiply (or a dot)
+        #  (4) Elsewise, either I... or J... not empty, and K... not empty, use a general matmul
 
         # Resolve the summation kind: dot, matmul or *
-        if not nop_shapes[i-1]:
+        if all(dim < 0 for dim in nop_axes[i-1]):
             # op1 is a scalar
             plan_scalar_prod(plan, operands, i-1, i)
         else:
