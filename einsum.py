@@ -399,6 +399,14 @@ def verify_shape(axes_list, operands):
         for s1, s2, ax1, ax2, op1, op2 in zip(sizes, sizes[1:], op_dims, op_dims[1:], ops, ops[1:]):
             assert s1 == s2, f'Dimension {ax1} in {op1.name} and dimension {ax2} in {op2.name} do not match in size.'
 
+def prod(iter, default=1):
+    if len(iter):
+        res = 1
+        for s in iter:
+            res *= s
+        return res
+    return default
+
 def plan_squeeze(plan, op, op_axes, op_shape, squeeze_axes):
     varname = f'op{op}'
     squeeze_dims = []
@@ -461,7 +469,7 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     K2_dims = [op2_axes[ax] for ax in K]
     I1_shape, J1_shape, K1_shape = [[op1_shape[dim] for dim in dims] for dims in (I1_dims, J1_dims, K1_dims)]
     I2_shape, J2_shape, K2_shape = [[op2_shape[dim] for dim in dims] for dims in (I2_dims, J2_dims, K2_dims)]
-    K1_size = sum(K1_shape)
+    K1_size, J1_size, J2_size = prod(K1_shape), prod(J1_shape), prod(J2_shape)
 
     perm1 = I1_dims + J1_dims + K1_dims
     perm2 = I2_dims + J2_dims + K2_dims
@@ -519,10 +527,8 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     # matrix-vector or matrix-matrix multiplies, depending on the operands' shapes.
     else:
         # Merge J dims and K dims by reshaping
-        merged_shape1 = I1_shape + [sum(J1_shape)] + [sum(K1_shape)]
-        merged_shape1 = [1 if size == 0 else size for size in merged_shape1]
-        merged_shape2 = I2_shape + [sum(J2_shape)] + [sum(K2_shape)]
-        merged_shape2 = [1 if size == 0 else size for size in merged_shape2]
+        merged_shape1 = I1_shape + [J1_size] + [K1_size]
+        merged_shape2 = I2_shape + [J2_size] + [K1_size]
 
         step = paddle.reshape, [var1], var1, merged_shape1
         plan.add_step(step)
@@ -719,7 +725,7 @@ def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
         squeeze_axes = []
         for j in range(ndims_out, ndims):
             dim = op_axes[j]
-            if shape[dim] == 1:
+            if dim >= 0 and shape[dim] == 1:
                 squeeze_axes.append(j)
                 label_count[j-ndims_out] -= 1
         if squeeze_axes:
@@ -940,36 +946,47 @@ def einsum(equation, *operands):
 if __name__ == '__main__':
     import numpy as np
 
-    x = np.random.randn(5, 1, 10000)
-    y = np.random.randn(100, 10000)
+    # x = np.random.randn(5, 1, 10000)
+    # y = np.random.randn(100, 10000)
 
-    tx = paddle.to_tensor(x)
-    ty = paddle.to_tensor(y)
+    # tx = paddle.to_tensor(x)
+    # ty = paddle.to_tensor(y)
 
-    equations = [               \
-        'ijk, jk',              \
-        '...k, ...k->...k',     \
-        'ij..., j...',          \
-        'ij..., j...->...'      \
-    ]
+    # equations = [               \
+    #     'ijk, jk',              \
+    #     '...k, ...k->...k',     \
+    #     'ij..., j...',          \
+    #     'ij..., j...->...'      \
+    # ]
 
-    for eqn in equations:
-        print(einsum(eqn, tx, ty))
+    # for eqn in equations:
+    #     print(einsum(eqn, tx, ty))
 
-    np.random.seed(102)
+    # np.random.seed(102)
 
-    tx = paddle.to_tensor(np.random.rand(4))
-    ty = paddle.to_tensor(np.random.rand(5))
+    # tx = paddle.to_tensor(np.random.rand(4))
+    # ty = paddle.to_tensor(np.random.rand(5))
 
-    equations =[
-        'i,i->'
-    ]
-    for eqn in equations:
-        print(einsum(eqn, tx, tx))
+    # equations =[
+    #     'i,i->'
+    # ]
+    # for eqn in equations:
+    #     print(einsum(eqn, tx, tx))
+
+    # equations = [
+    #     'i,j->ij',
+    #     'i,j->'
+    # ]
+    # for eqn in equations:
+    #     print(einsum(eqn, tx, ty))
+
+    x = np.random.randn(10, 1, 4, 256)
+    y = np.random.randn(256, 10, 1)
+    
+    tx, ty = paddle.to_tensor(x), paddle.to_tensor(y)
 
     equations = [
-        'i,j->ij',
-        'i,j->'
+        'abcd,dfg->d'
     ]
     for eqn in equations:
-        print(einsum(eqn, tx, ty))
+        print(einsum(eqn, tx, ty).shape)
