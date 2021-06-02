@@ -356,7 +356,7 @@ def dims_index(in_labels, out_labels):
     in_labels = 'ij..', out_labels = '..kji'
     inv_map = [2, 3, -1, 1, 0]
     '''
-    print(f"in labels: '{in_labels}'     out labels: '{out_labels}'")
+    # print(f"in labels: '{in_labels}'     out labels: '{out_labels}'")
 
     inv_map = [-1] * len(out_labels)
     
@@ -383,8 +383,8 @@ def dims_index(in_labels, out_labels):
     return inv_map
 
 def verify_shape(axes_list, operands):
-    for axes in axes_list:
-        print(axes)
+    # for axes in axes_list:
+        # print(axes)
     op_shapes = [op.shape for op in operands]
     for ax_dims in zip(*axes_list):
         # axes are a column of nop input dimension axes. -1 represents new axis
@@ -415,11 +415,15 @@ def plan_squeeze(plan, op, op_axes, op_shape, squeeze_axes):
     for ax in squeeze_axes:
         dim = op_axes[ax]
         squeeze_dims.append(dim)
-        for i, d in enumerate(op_axes):
-            if d > dim:
-                op_axes[i] -= 1
         op_axes[ax] = -1
+    for dim in sorted(squeeze_dims)[-1:]:
         op_shape.pop(dim)
+
+    dims_left = sorted(dim for dim in op_axes if dim >= 0)
+    for i in range(len(op_axes)):
+        old = op_axes[i]
+        if old >= 0:
+            op_axes[i] = dims_left.index(old)
     # Be aware that the op label string is not updated yet...
 
     step = paddle.squeeze, [varname], varname, squeeze_dims
@@ -436,15 +440,20 @@ def plan_reduce(plan, op, op_axes, op_shape, reduce_axes):
     for ax in reduce_axes:
         dim = op_axes[ax]
         reduce_dims.append(dim)
-        for i, d in enumerate(op_axes):
-            if d > dim:
-                op_axes[i] -= 1
         op_axes[ax] = -1
+    for dim in sorted(reduce_dims)[-1:]:
         op_shape.pop(dim)
-    # Be aware that the op label string is not updated yet...
+
+    dims_left = sorted(dim for dim in op_axes if dim >= 0)
+    for i in range(len(op_axes)):
+        old = op_axes[i]
+        if old >= 0:
+            op_axes[i] = dims_left.index(old)
 
     step = paddle.sum, [varname], varname, reduce_dims
     plan.add_step(step)
+
+    # Be aware that the op label string is not updated yet...
 
 def plan_scalar_prod(plan, operands, op1, op2):    
     varnames = [f'op{op1}', f'op{op2}']
@@ -475,7 +484,7 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     perm2 = I2_dims + J2_dims + K2_dims
     
     if any(i != dim for i, dim in enumerate(perm1)):
-        print(f'perm1: {perm1}')
+        # print(f'perm1: {perm1}')
         step = paddle.transpose, [var1], var1, perm1
         plan.add_step(step)
         # update axes index
@@ -485,7 +494,7 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
                 op1_axes[i] = new_dim
 
     if any(i != dim for i, dim in enumerate(perm2)):
-        print(f'perm2: {perm2}')
+        # print(f'perm2: {perm2}')
         step = paddle.transpose, [var2], var2, perm2
         plan.add_step(step)
         # update axes index
@@ -604,7 +613,7 @@ def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label
                     label_count[ax - ndims_out] -= 1
 
     # Now it's OK to merge the K dims as the same shape holds
-    print(f'I: {I}   J1: {J1}    J2: {J2}   K: {K}')
+    # print(f'I: {I}   J1: {J1}    J2: {J2}   K: {K}')
 
     plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
 
@@ -674,7 +683,7 @@ class Plan:
     def execute(self):
         res = None
         for f, in_varnames, out_varname, *args in self.steps:
-            print(repr((out_varname, f, *in_varnames, *args)))
+            # print(repr((out_varname, f, *in_varnames, *args)))
             res = f(*map(self.get_var, in_varnames), *args)
             if out_varname:
                 self.set_var(out_varname, res)
@@ -900,7 +909,7 @@ def einsum(equation, *operands):
     else:
         output_labels = parse_output_labels(rhs, list(label_count.keys()), n_bcast_dims)
 
-    print(f'equation:   {equation}')
+    # print(f'equation:   {equation}')
 
     # The rest labels need to be combined.
     for l in output_labels:
@@ -913,13 +922,13 @@ def einsum(equation, *operands):
     # Reorder all_labels to be consistent 
     all_labels = output_labels + combined_labels
 
-    print(f'labels => output: {output_labels}   combine: {combined_labels}')
+    # print(f'labels => output: {output_labels}   combine: {combined_labels}')
 
 
     # Label counters for combined labels
     label_count = [label_count[l] for l in combined_labels]
 
-    print(f'label count:  {label_count}')
+    # print(f'label count:  {label_count}')
 
     # Build global_dims_index, a data structure that maintains the mapping from all_labels
     # to the dimensions in the remained operands during the summation process.  
@@ -980,13 +989,18 @@ if __name__ == '__main__':
     # for eqn in equations:
     #     print(einsum(eqn, tx, ty))
 
-    x = np.random.randn(10, 1, 4, 256)
-    y = np.random.randn(256, 10, 1)
+    # x = np.random.randn(10, 1, 4, 256)
+    # y = np.random.randn(256, 10, 1)
     
-    tx, ty = paddle.to_tensor(x), paddle.to_tensor(y)
+    # tx, ty = paddle.to_tensor(x), paddle.to_tensor(y)
 
-    equations = [
-        'abcd,dfg->d'
-    ]
-    for eqn in equations:
-        print(einsum(eqn, tx, ty).shape)
+    # equations = [
+    #     'abcd,dfg->d'
+    # ]
+    # for eqn in equations:
+    #     print(einsum(eqn, tx, ty).shape)
+
+    x = np.random.rand(10000, 100, 10)
+    tx = paddle.to_tensor(x)
+
+    print(einsum('ijk->', tx).shape)
