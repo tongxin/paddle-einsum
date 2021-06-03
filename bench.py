@@ -30,6 +30,8 @@ def bench_sum1():
     code_snippets = {  \
         'np': r"np.einsum('ijk->j', x).shape", \
         'my': r"einsum('ijk->j', px).shape", \
+        'sum_all': r"px.sum(0, 2).shape", \
+        'sum_dim': r"px.sum(2, keepdim=True).sum(0, keepdim=True).squeeze().shape", \
         'nlp': r"nlp_einsum('ijk->j', px).shape"
     }
     print(r"times for 'ijk->j'")
@@ -72,17 +74,20 @@ if __name__ == '__main__':
 
     x = np_x_ultra_large
     px = paddle.to_tensor(x)
-    tx = torch.tensor(x, device='cuda:0')
-    # bench_sum()
-    # bench_sum1()
-    # bench_transpose()
+    tx = torch.tensor(x)
+    # tx = torch.tensor(x, device='cuda:0')
+    bench_sum()
+    bench_sum1()
+    bench_transpose()
 
-    # y = np.random.rand(1000)
-    # py = paddle.to_tensor(y)
+    y = np.random.rand(1000)
+    py = paddle.to_tensor(y)
+    ty = torch.tensor(y)
     # ty = torch.tensor(y, device='cuda:0')
-    # bench_matrix_vector()
+    bench_matrix_vector()
 
     y = np_y_large
     py = paddle.to_tensor(y)
-    ty = torch.tensor(y, device='cuda:0')
+    ty = torch.tensor(y)
+    # ty = torch.tensor(y, device='cuda:0')
     bench_bmm()

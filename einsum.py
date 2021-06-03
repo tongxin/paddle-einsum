@@ -47,7 +47,7 @@ def parse_op_labels(labelstr, operand):
 
     return full_labelstr
 
-def parse_and_count_labels(labelstr, operands):
+def parse_labels(labelstr, operands):
     '''
     Parse out a list of distinct labels and count their number of occurrences.
     
@@ -62,28 +62,33 @@ def parse_and_count_labels(labelstr, operands):
     -------
     nop_label:
         list of full label strings matching the each operand's dimensino size
-    count:
-        the number of occurrences for each label
     '''
-    # Counters for 26 alphabetical letters
-    
-    count = {label : 0 for label in 'abcdefghijklmnopqrstuvwxyz'}
-    count = {}
 
     nop_labels = labelstr.split(',')
     assert len(nop_labels) == len(operands), \
         f"Invalid equation: the number of operands is {len(operands)} but only found {len(nop_labels)} in the label string."
     
-    nop_labels = list(map(parse_op_labels, nop_labels, operands))
+    return list(map(parse_op_labels, nop_labels, operands))
 
-    for labels in nop_labels:
-        for c in set(labels.replace('.', '')):
+def count_and_weight_labels(nop_labels, operands):
+    '''
+    Count and measure the cardinality of each labeled dimension. This function assumes labels
+    are non-duplicate in each operand.
+    '''
+    count, cardinality = {}, {}
+
+    for labels, op in zip(nop_labels, operands):
+        for c, s in zip(labels, op.shape):
+            if c in '.':
+                continue
             if c in count:
                 count[c] += 1
+                cardinality[c] = max(cardinality[c], s)
             else:
                 count[c] = 1
-    
-    return nop_labels, count
+                cardinality[c] = s
+
+    return count, cardinality
 
 def parse_output_labels(rhs, avail_labels, n_bcast_dims):
     '''
@@ -683,7 +688,7 @@ class Plan:
     def execute(self):
         res = None
         for f, in_varnames, out_varname, *args in self.steps:
-            # print(repr((out_varname, f, *in_varnames, *args)))
+            print(repr((out_varname, f, *in_varnames, *args)))
             res = f(*map(self.get_var, in_varnames), *args)
             if out_varname:
                 self.set_var(out_varname, res)
@@ -892,10 +897,13 @@ def einsum(equation, *operands):
     rhs = rhs[0] if rhs else None
 
     # Parse labels for each operand and count the number of occurrences for each alphabet label
-    nop_labels, label_count = parse_and_count_labels(lhs, operands)
+    nop_labels = parse_labels(lhs, operands)
 
     # Diagonalize the operands which have duplicate labels
     nop_labels, operands = list(zip(*map(diagonalize, nop_labels, operands)))
+
+    # Count the labels and measure the corresponding dimension cardinality for each label
+    label_count, label_card = count_and_weight_labels(nop_labels, operands)
 
     # To handle broadcasting, we should first know how many dimensions are there
     # We need to use that number to generate output labels
@@ -903,7 +911,8 @@ def einsum(equation, *operands):
     n_bcast_dims = max(map(count_bcast_dims, nop_labels, operands))
 
     # Parse or infer output labels. The broadcasting dimensions should be taken care of.
-    # Following the Numpy's rule, the broadcasting dimensions must be present in the output. 
+    # Following the Numpy's rule, the output labels must include the broadcasting dimensions,
+    # if there are any. 
     if rhs is None:
         output_labels = infer_output_labels(label_count, n_bcast_dims)
     else:
@@ -911,24 +920,26 @@ def einsum(equation, *operands):
 
     # print(f'equation:   {equation}')
 
-    # The rest labels need to be combined.
+    # The remaining labels need to be combined. Label count is only useful for dimensions to be combined.
     for l in output_labels:
-        if l in label_count:
+        if l not in '.':
             label_count.pop(l)
+            label_card.pop(l)
 
-    combined_labels = ''.join(label_count.keys())
+    # Sort the combined labels and move larger sized dimensions to the right
+    if label_count:
+        label_card, combined_labels = list(zip(*sorted((c, l) for l, c in label_card.items())))
+        label_card = list(label_card)
+        label_count = [label_count[l] for l in combined_labels]
+    else:
+        combined_labels = []
+        label_card = []
+        label_count = []
     
-
-    # Reorder all_labels to be consistent 
-    all_labels = output_labels + combined_labels
+    # The label order is now resolved
+    all_labels = output_labels + ''.join(combined_labels)
 
     # print(f'labels => output: {output_labels}   combine: {combined_labels}')
-
-
-    # Label counters for combined labels
-    label_count = [label_count[l] for l in combined_labels]
-
-    # print(f'label count:  {label_count}')
 
     # Build global_dims_index, a data structure that maintains the mapping from all_labels
     # to the dimensions in the remained operands during the summation process.  
@@ -955,52 +966,52 @@ def einsum(equation, *operands):
 if __name__ == '__main__':
     import numpy as np
 
-    # x = np.random.randn(5, 1, 10000)
-    # y = np.random.randn(100, 10000)
+    x = np.random.randn(5, 1, 10000)
+    y = np.random.randn(100, 10000)
 
-    # tx = paddle.to_tensor(x)
-    # ty = paddle.to_tensor(y)
+    tx = paddle.to_tensor(x)
+    ty = paddle.to_tensor(y)
 
-    # equations = [               \
-    #     'ijk, jk',              \
-    #     '...k, ...k->...k',     \
-    #     'ij..., j...',          \
-    #     'ij..., j...->...'      \
-    # ]
+    equations = [               \
+        'ijk, jk',              \
+        '...k, ...k->...k',     \
+        'ij..., j...',          \
+        'ij..., j...->...'      \
+    ]
 
-    # for eqn in equations:
-    #     print(einsum(eqn, tx, ty))
+    for eqn in equations:
+        print(einsum(eqn, tx, ty))
 
-    # np.random.seed(102)
+    np.random.seed(102)
 
-    # tx = paddle.to_tensor(np.random.rand(4))
-    # ty = paddle.to_tensor(np.random.rand(5))
+    tx = paddle.to_tensor(np.random.rand(4))
+    ty = paddle.to_tensor(np.random.rand(5))
 
-    # equations =[
-    #     'i,i->'
-    # ]
-    # for eqn in equations:
-    #     print(einsum(eqn, tx, tx))
+    equations =[
+        'i,i->'
+    ]
+    for eqn in equations:
+        print(einsum(eqn, tx, tx))
 
-    # equations = [
-    #     'i,j->ij',
-    #     'i,j->'
-    # ]
-    # for eqn in equations:
-    #     print(einsum(eqn, tx, ty))
+    equations = [
+        'i,j->ij',
+        'i,j->'
+    ]
+    for eqn in equations:
+        print(einsum(eqn, tx, ty))
 
-    # x = np.random.randn(10, 1, 4, 256)
-    # y = np.random.randn(256, 10, 1)
+    x = np.random.randn(10, 1, 4, 256)
+    y = np.random.randn(256, 10, 1)
     
-    # tx, ty = paddle.to_tensor(x), paddle.to_tensor(y)
+    tx, ty = paddle.to_tensor(x), paddle.to_tensor(y)
 
-    # equations = [
-    #     'abcd,dfg->d'
-    # ]
-    # for eqn in equations:
-    #     print(einsum(eqn, tx, ty).shape)
+    equations = [
+        'abcd,dfg->d'
+    ]
+    for eqn in equations:
+        print(einsum(eqn, tx, ty))
 
     x = np.random.rand(10000, 100, 10)
     tx = paddle.to_tensor(x)
 
-    print(einsum('ijk->', tx).shape)
+    print(einsum('ijk->', tx))
