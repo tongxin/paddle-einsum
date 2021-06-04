@@ -70,104 +70,27 @@ def parse_labels(labelstr, operands):
     
     return list(map(parse_op_labels, nop_labels, operands))
 
-def count_and_weight_labels(nop_labels, operands):
-    '''
-    Count and measure the cardinality of each labeled dimension. This function assumes labels
-    are non-duplicate in each operand.
-    '''
-    count, cardinality = {}, {}
-
-    for labels, op in zip(nop_labels, operands):
-        for c, s in zip(labels, op.shape):
-            if c in '.':
-                continue
-            if c in count:
-                count[c] += 1
-                cardinality[c] = max(cardinality[c], s)
-            else:
-                count[c] = 1
-                cardinality[c] = s
-
-    return count, cardinality
-
-def parse_output_labels(rhs, avail_labels, n_bcast_dims):
-    '''
-    Parse explicit output labels given on the right hand side of '->' and the available
-    input labels.
-
-    Parameters
-    ----------
-    rhs:
-        the output label string, given by the right hand side of the einsum equation
-    avail_labels:
-        the available labels to check with
-    n_bcast_dims:
-        the number of broadcast dimensions
-
-    Returns
-    -------
-    The output labels in a string
-    '''
-    # Sanity check. Only alphabet is allowed if not '.'
-    assert all(c in avail_labels for c in rhs.replace('.', '')), f"Invalid equation: output labels must come from the input labels. "
-
-    # Syntax check. Verify there's no duplicate alphabetical labels
-    for i, l in enumerate(rhs.replace('.', '')):
-        if rhs.find(l, 0, i) >= 0:
-            assert False, f"Invalid equation: duplicate output label {l}."
-
-    # Check there's no dots other than in an ellipsis
-    assert rhs.replace('...', '', 1).find('.') == -1, \
-        f"Invalid equation: `.` is only expected to be included in an ellipsis."
-    
-    # Check if ellipsis is missing
-    assert (n_bcast_dims > 0) == (rhs.find('...') >= 0), \
-        f"Invalid equation: there are broadcasting dimensions yet found no '...' in the output labels."
-
-    out_labels = rhs.replace('...', '.' * n_bcast_dims, 1) if n_bcast_dims > 0 else rhs
-
-    return out_labels
-
-def has_bcast_dims(extended_labels, operand=None):
-    '''
-    Returns whether there are non-labeled dimensions by checking the extended labels 
-    '''
-    return '.' in extended_labels
+def validate_rhs(rhs, input_labels, n_bcast_dims):
+    # Sanity check.
+    if n_bcast_dims > 0:
+        assert '...' in rhs, f"Invalid equation: missing ellipsis in output labels"
+    rhs = rhs.replace('...', '')
+    rhs_set = set(rhs)
+    # Hidden assumption: availble labels don't include '.'
+    assert '.' not in input_labels
+    # Verify that output labels all come from the set of input labels
+    non_input_labels = rhs_set.difference(input_labels)
+    assert not non_input_labels, \
+        f"Invalid equation: output label '{non_input_labels}' not used by any input."
+    # Verify that output labels are not duplicate
+    assert len(rhs) == len(rhs_set), \
+        f"Invalid equation: duplicate output labels are found."
 
 def count_bcast_dims(extended_labels, operand=None):
     '''
     Returns the number of broadcast dimensions
     '''
     return extended_labels.count('.')
-
-def get_bcast_dims_indices_and_shape(op_shape, op_labels):
-    '''
-    Returns the indices and shape of the broadcast dimensions.
-
-    Parameters
-    ----------
-    op_shape:
-        the tensor shape of the operand
-    op_labels:
-        the extended label string for the operand. Broadcast dimensions are labeled with dots.
-    
-
-    Returns
-    -------
-    indices:
-        the indices of the broadcast dimensions
-    shape:
-        the sizes of the broadcast dimensions
-    '''
-    assert len(op_shape) == len(op_labels)
-
-    indices, shape = [], []
-    for i, size, label in zip(range(len(op_shape)), op_shape, op_labels):
-        if label == '.':
-            indices.append(i)
-            shape.append(size)
-
-    return indices, shape
 
 def bcastable_test(args, f=None):
     '''
@@ -201,63 +124,43 @@ def bcastable_test(args, f=None):
     for xi, yi in zip(xran_inv, yran_inv):
         f(xi, yi)
 
-def gather_labels(labels_list, bcast_ndims):
+def part_labels(nop_labels, rhs, n_bcast_dims):
     '''
-    Returns a sorted string of all labels in the list including dots 
+    Part labels in two strings, the output label string and the combined label string. 
+    Infer output labels in case no explicit right hand side is given. In this case
+    the output label string is formed by labels that count only once, in alphabetical order.
+
+    Returns
+    -------
+    output:
+        output label string
+    combine:
+        combine label string
+    count:
+        combine labels' count
     '''
-    labelset = set()
-
-    for l in labels_list:
-        labelset.update(l)
-
-    return ''.join(sorted(labelset)).replace('.', '.' * bcast_ndims)
-
-def gather_singular_labels(labels_list, alphabet_only=True):
-    '''
-    Returns the labels which only show in one operand
-    Parameter alphabet_only indicates whether to count labels in [a-z] only
-    '''
-    all_labels = sorted(''.join(labels_list))    
-
-    _off = 0
-    if alphabet_only:
-        for i, l in enumerate(all_labels):
-            if l.isalpha():
-                _off = i
-                break
-
-    all_labels = all_labels[_off:]
-
-    singular_labels = []
-    last_label, count = None, 0
-    for l in all_labels:
-        if (l != last_label):
-            # new label, the last label is singular is count is one
-            if count == 1:
-                singular_labels.append(l)
-            label, count = l, 1
+    # Put all labels in alphabetical order
+    concat = sorted(''.join(nop_labels).replace('.', ''))
+    labels, count = [], []
+    for a, b in zip(['.'] + concat, concat):
+        if a != b:
+            labels.append(b)
+            count.append(1)
         else:
-            count += 1
-    if count == 1:
-        singular_labels.append(all_labels[-1])
-
-    return ''.join(singular_labels)
-
-
-
-def infer_output_labels(label_count, n_bcast_dims):
-    '''
-    Infer output labels in case no explicit output labels are given on the right hand side of '->'.
-    The output labels are those that appear only once, put in alphabetical order. 
-    Returns the output labels in a string
-    '''
-    # Broadcast labels come first
-    output_labels = '.' * n_bcast_dims
-    # Followed by singular labels
-    singular_labels = list(l for l, cnt in label_count.items() if cnt == 1)
-    output_labels += ''.join(sorted(singular_labels))
-
-    return output_labels
+            count[-1] += 1
+    if rhs != None:
+        validate_rhs(rhs, labels, n_bcast_dims)
+        output = rhs.replace('...', '.' * n_bcast_dims)
+    else:
+        output = '.' * n_bcast_dims + ''.join(l for l, c in zip(labels, count) if c == 1)
+    
+    for i in range(len(count))[::-1]:  # Ouch ... it hurts to get confused with [-1:]
+        if labels[i] in output:
+            labels.pop(i)
+            count.pop(i)
+    
+    combine = ''.join(labels)
+    return output, combine, count
 
 def dim_strides(shape):
     '''
@@ -680,7 +583,7 @@ class Plan:
     def show(self):
         res = None
         for f, in_varnames, out_varname, *args in self.steps:
-            line = repr((out_varname, f, *in_varnames, *args))
+            print(repr((out_varname, f, *in_varnames, *args)))
             if out_varname:
                 self.set_var(out_varname, res)
         return res
@@ -688,7 +591,6 @@ class Plan:
     def execute(self):
         res = None
         for f, in_varnames, out_varname, *args in self.steps:
-            print(repr((out_varname, f, *in_varnames, *args)))
             res = f(*map(self.get_var, in_varnames), *args)
             if out_varname:
                 self.set_var(out_varname, res)
@@ -902,9 +804,6 @@ def einsum(equation, *operands):
     # Diagonalize the operands which have duplicate labels
     nop_labels, operands = list(zip(*map(diagonalize, nop_labels, operands)))
 
-    # Count the labels and measure the corresponding dimension cardinality for each label
-    label_count, label_card = count_and_weight_labels(nop_labels, operands)
-
     # To handle broadcasting, we should first know how many dimensions are there
     # We need to use that number to generate output labels
     # e.g. 1 for ['ij', 'i.', '.k']
@@ -913,51 +812,30 @@ def einsum(equation, *operands):
     # Parse or infer output labels. The broadcasting dimensions should be taken care of.
     # Following the Numpy's rule, the output labels must include the broadcasting dimensions,
     # if there are any. 
-    if rhs is None:
-        output_labels = infer_output_labels(label_count, n_bcast_dims)
-    else:
-        output_labels = parse_output_labels(rhs, list(label_count.keys()), n_bcast_dims)
-
-    # print(f'equation:   {equation}')
-
-    # The remaining labels need to be combined. Label count is only useful for dimensions to be combined.
-    for l in output_labels:
-        if l not in '.':
-            label_count.pop(l)
-            label_card.pop(l)
-
-    # Sort the combined labels and move larger sized dimensions to the right
-    if label_count:
-        label_card, combined_labels = list(zip(*sorted((c, l) for l, c in label_card.items())))
-        label_card = list(label_card)
-        label_count = [label_count[l] for l in combined_labels]
-    else:
-        combined_labels = []
-        label_card = []
-        label_count = []
+    out_labels, combine_labels, combine_count  = part_labels(nop_labels, rhs, n_bcast_dims)
     
     # The label order is now resolved
-    all_labels = output_labels + ''.join(combined_labels)
+    all_labels = out_labels + combine_labels
 
-    # print(f'labels => output: {output_labels}   combine: {combined_labels}')
+    print(f'labels => output: {out_labels}   combine: {combine_labels}')
 
-    # Build global_dims_index, a data structure that maintains the mapping from all_labels
+    # Build global_index, a data structure that maintains the mapping from all_labels
     # to the dimensions in the remained operands during the summation process.  
     f = lambda labels: dims_index(labels, all_labels)
-    global_dims_index = list(map(f, nop_labels))
+    global_index = list(map(f, nop_labels))
 
     # Verify that all aligned dimensions are broadcastable in size across operands
-    verify_shape(global_dims_index, operands)
+    verify_shape(global_index, operands)
 
     # Reorder the operands and possibly reduce the summation complexity
-    perm = reorder_ops(global_dims_index)
+    perm = reorder_ops(global_index)
 
     operands = [operands[i] for i in perm]
     nop_labels = [nop_labels[i] for i in perm]
-    global_dims_index = [global_dims_index[i] for i in perm]
+    global_index = [global_index[i] for i in perm]
 
     # Now we're ready to build up an execution plan
-    args = [operands, global_dims_index, n_bcast_dims, label_count]
+    args = [operands, global_index, n_bcast_dims, combine_count]
     plan = plan_einsum(*args)
     result = plan.execute()
 
@@ -979,6 +857,8 @@ if __name__ == '__main__':
         'ij..., j...->...'      \
     ]
 
+    einsum('ijk->j', tx)
+    
     for eqn in equations:
         print(einsum(eqn, tx, ty))
 
