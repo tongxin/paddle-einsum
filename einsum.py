@@ -233,18 +233,19 @@ def build_global_view(nop_labels, rhs, n_bcast_dims):
             labels.pop(i)
             count.pop(i)
     
-    g_labels_combine = ''.join(labels)
-    g_labels = g_labels_out + g_labels_combine
-    g_view = map(lambda i: build_view(i, o), nop_labels)
-    g_combine = count
+    g_labels_sum = ''.join(labels)
+    g_labels = g_labels_out + g_labels_sum
+    g_view = map(lambda i: build_view(i, g_labels_out), nop_labels)
+    g_nout = len(g_labels_out)
+    g_count = count
     
-    return g_labels, g_labels_out, g_labels_combine, g_view, g_combine
+    return g_labels, g_view, g_nout, g_count
 
-def build_global_shape(g_view, op_shapes):
+def build_global_shape(g_view, op_shapes, g_count):
     view_shapes = []
     g_masks = []
     for view, op_shape in zip(g_view, op_shapes):
-        view_shape = [op_shape[dim] if dim > -1 else 1 for i, dim in enumerate(view)]
+        view_shape = [op_shape[dim] if dim > -1 else 1 for dim in view]
         view_shapes.append(view_shape)
     g_shape = [set(sizes_per_ax) - {1} for sizes_per_ax in zip(*view_shapes)]
     assert not any(len(sizes) > 1 for sizes in g_shape), \
@@ -377,28 +378,14 @@ def plan_squeeze(plan, op, op_axes, op_shape, squeeze_axes):
     step = paddle.squeeze, [varname], varname, squeeze_dims
     plan.add_step(step)
 
-def plan_reduce(plan, op, op_axes, op_shape, reduce_axes):
+def plan_reduce(plan, op, reduce_dims):
     '''
     Add reduce to the plan
     '''
     varname = f'op{op}'
-    reduce_dims = []
 
-    # Update axes and reset mappings for squeezed dims
-    for ax in reduce_axes:
-        dim = op_axes[ax]
-        reduce_dims.append(dim)
-        op_axes[ax] = -1
-    for dim in sorted(reduce_dims)[-1:]:
-        op_shape.pop(dim)
-
-    dims_left = sorted(dim for dim in op_axes if dim >= 0)
-    for i in range(len(op_axes)):
-        old = op_axes[i]
-        if old >= 0:
-            op_axes[i] = dims_left.index(old)
-
-    step = paddle.sum, [varname], varname, reduce_dims
+    f = lambda var, dims: paddle.sum(var, dims, keepdim=True)
+    step = f, [varname], varname, reduce_dims
     plan.add_step(step)
 
     # Be aware that the op label string is not updated yet...
@@ -653,7 +640,7 @@ def reorder_ops(nop_axes):
     return perm
 
 # def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
-def plan_einsim(operands, g_view, g_shape, g_masks, g_combine):
+def plan_einsim(operands, g_view, g_shape, g_op_masks, g_count):
     '''
     Plans the actual execution steps.
 
@@ -662,9 +649,8 @@ def plan_einsim(operands, g_view, g_shape, g_masks, g_combine):
     the execution plan
     '''
     nop = len(operands)
-    ndims = len(nop_axes[0])
-    ndims_combine = len(label_count)
-    ndims_out = ndims - ndims_combine
+    ndim = len(g_view[0])
+    nout = ndim - len(g_count)
 
     # Initialize a plan with an environment
     plan = Plan()
@@ -673,31 +659,40 @@ def plan_einsim(operands, g_view, g_shape, g_masks, g_combine):
     nop_shapes = [list(op.shape) for op in operands]
 
     # In case no dimensions to combine, do broadcast straight across
-    if not ndims_combine:
-        plan_broadcast(plan, operands, nop_axes)
+    if not g_count:
+        plan_broadcast(plan, operands, g_view)
         return plan
 
-    # Canonicalize by removing size-1 to-combine dimensions
-    for i, op_axes, shape in zip(range(nop), nop_axes, nop_shapes):
-        squeeze_axes = []
-        for j in range(ndims_out, ndims):
-            dim = op_axes[j]
-            if dim >= 0 and shape[dim] == 1:
-                squeeze_axes.append(j)
-                label_count[j-ndims_out] -= 1
-        if squeeze_axes:
-            plan_squeeze(plan, i, nop_axes[i], nop_shapes[i], squeeze_axes)
+    # # Canonicalize by removing size-1 to-combine dimensions
+    # for i, op_axes, shape in zip(range(nop), g_view, nop_shapes):
+    #     squeeze_axes = []
+    #     for j in range(ndims_out, ndims):
+    #         dim = op_axes[j]
+    #         if dim >= 0 and shape[dim] == 1:
+    #             squeeze_axes.append(j)
+    #             label_count[j-ndims_out] -= 1
+    #     if squeeze_axes:
+    #         plan_squeeze(plan, i, nop_axes[i], nop_shapes[i], squeeze_axes)
 
-    # Reduce dimensions whose label_count == 1
-    for i, op_axes in enumerate(nop_axes):
-        reduce_axes = []
-        for j in range(ndims_out, ndims):
-            dim = op_axes[j]
-            if dim >= 0 and label_count[j-ndims_out] == 1:
-                reduce_axes.append(j)
-                label_count[j-ndims_out] = 0
-        if reduce_axes:
-            plan_reduce(plan, i, nop_axes[i], nop_shapes[i], reduce_axes)
+    # Down count the trivial dimensions on each axis >= nout
+    for view, mask in zip(g_view, g_op_masks):
+        down_count = [1 if (dim > -1 and not masked) else 0 for dim, masked in zip(view[nout:], mask[nout:])]
+        for i, d in enumerate(down_count):
+            g_count[i] -= d
+
+    # Reduce dimensions whose g_mask is set and g_count == 1
+    for i, view, mask in zip(range(nop), g_view, g_op_masks):
+        to_reduce = []
+        for dim, masked, count in zip(view[nout:], mask[nout:], g_count):
+            to_reduce.append(dim if (masked and count == 1) else -1)
+        
+        reduce_dims = filter(lambda x: x > -1, to_reduce)
+        plan_reduce(plan, i, reduce_dims)
+
+        for i, d in enumerate(to_reduce):
+            ax = i + nout
+            mask[ax] = mask[ax] and (d < 0)   
+            g_count[i] -= (0 if d < 0 else 1)
 
     # Plan the summations over the operand sequence
     for i in range(nop):
@@ -855,43 +850,47 @@ def einsum(equation, *operands):
     # if there are any. 
     out_labels, combine_labels, combine_count  = part_labels(nop_labels, rhs, n_bcast_dims)
 
-    # Build the data structures for planning. It's helpful to think that all the operands
-    # are broadcasting together from the perspective of a global view. In this global
-    # view, the dimensions in multiple operands with a unique label are mapped to the same
-    # dimension. Broadcasting dimensions are mapped right aligned. The map is injective 
-    # from each operand's dimensions to the global view, and is on-to from all operand's 
-    # dimensions to the global view.   
+    # Build the data structures for planning. It's helpful to think of all the operands
+    # broadcasting together from a global view. In this view, dimensions from multiple 
+    # operands are mapped to the same position if they are labeled uniquely. Broadcasting
+    # dimensions are mapped to adjacent positions with the right bound fixed. Subject to
+    # each operand, the map is injective but for all operands the map is on-to.  
     # g_labels:
     #   The labels of the global view 
     # g_view:
     #   Includes a list of maps from each operand's dimensions to the global view's dimensions
     #   which we refer to as ax or axes in the code to distinguish from operand's dims
-    # g_shape
+    # g_shape:
     #   The shape of the global view. The size of each dimension is what the aligned dimensions
     #   should broadcast to
-    # g_masks
+    # g_nout:
+    #   Number of output axes
+    # g_op_masks
     #   A list of masks that specify each operand's non-trivial dimensions
-    # g_combine
-    #   Counting how many remaining non-trivial dimensions to combine for each ax
+    # g_count
+    #   Counting how many non-trivial dimensions remain for each ax
  
-    g_labels, g_labels_out, g_labels_combine, g_view, g_combine = build_global_view(nop_labels, rhs, n_bcast_dims)
-    g_shape, g_masks = build_global_shape(g_view, [op.shape for op in operands])
+    g_labels, g_view, g_nout, g_count = build_global_view(nop_labels, rhs, n_bcast_dims)
+    g_shape, g_op_masks = build_global_shape(g_view, [op.shape for op in operands])
 
-    print(f'labels => output: {g_labels_out}   combine: {g_labels_combine}')
+    g_labels_out = g_labels[:g_nout]
+    g_labels_sum = g_labels[g_nout:]
+
+    print(f'labels => output: {g_labels_out}   combine: {g_labels_sum}')
 
     # Verify that all aligned dimensions are broadcastable in size across operands
     # verify_shape(g_view, operands)
 
     # Reorder the operands and possibly reduce the summation complexity
-    perm = reorder_ops(global_index)
+    perm = reorder_ops(g_view)
 
     operands = [operands[i] for i in perm]
     nop_labels = [nop_labels[i] for i in perm]
-    global_index = [global_index[i] for i in perm]
+    g_view = [g_view[i] for i in perm]
 
     # Now we're ready to build up an execution plan
     # args = [operands, global_index, n_bcast_dims, combine_count]
-    args = operands, g_view, g_shape, g_masks, g_combine
+    args = operands, g_view, g_shape, g_op_masks, g_count
     plan = plan_einsum(*args)
     result = plan.execute()
 
