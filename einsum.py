@@ -396,20 +396,20 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
         step = paddle.transpose, [var1], var1, perm1
         plan.add_step(step)
         # update axes index
-        for i, dim in enumerate(op1_axes):
-            if dim > 0:
-                new_dim = perm1.index(dim)
-                op1_axes[i] = new_dim
+        # for i, dim in enumerate(op1_axes):
+        #     if dim >= 0:
+        #         new_dim = perm1.index(dim)
+        #         op1_axes[i] = new_dim
 
     if any(i != dim for i, dim in enumerate(perm2)):
         # print(f'perm2: {perm2}')
         step = paddle.transpose, [var2], var2, perm2
         plan.add_step(step)
         # update axes index
-        for i, dim in enumerate(op2_axes):
-            if dim > 0:
-                new_dim = perm2.index(dim)
-                op2_axes[i] = new_dim
+        # for i, dim in enumerate(op2_axes):
+        #     if dim >= 0:
+        #         new_dim = perm2.index(dim)
+        #         op2_axes[i] = new_dim
 
     # In case no K... dimensions remain, do a broadcast
     if not K:
@@ -459,11 +459,11 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     # The result shape is in I..., J1, J2. Let's reshape back to known dimensions
     # Note, this is static deduction, not by reading the tensor shape at runtime
     result_shape = [1] * len(I)
-    for ax in I:
+    for i, ax in enumerate(I):
         dim1, dim2 = op1_axes[ax], op2_axes[ax]
         s = 1 if dim1 < 0 else op1_shape[dim1]
         s = s if dim2 < 0 else max(s, op2_shape[dim2])
-        result_shape[ax] = s
+        result_shape[i] = s
     if J1:
         result_shape += J1_shape
     if J2:
@@ -844,6 +844,12 @@ def einsum(equation, *operands):
 if __name__ == '__main__':
     import numpy as np
 
+    x = paddle.rand([1, 5, 2, 2, 3, 4])
+    y = paddle.rand([5, 2, 3, 4])
+    z = paddle.rand([2, 1, 2])
+    t = paddle.rand([1, 5, 2, 3, 4])
+    einsum('abcdef, bcef, cad', x, y, z)
+
     x = np.random.randn(5, 1, 10000)
     y = np.random.randn(100, 10000)
 
@@ -895,3 +901,4 @@ if __name__ == '__main__':
     tx = paddle.to_tensor(x)
 
     print(einsum('ijk->', tx))
+
