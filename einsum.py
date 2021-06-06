@@ -235,13 +235,13 @@ def build_global_view(nop_labels, rhs, n_bcast_dims):
     
     g_labels_sum = ''.join(labels)
     g_labels = g_labels_out + g_labels_sum
-    g_view = map(lambda i: build_view(i, g_labels_out), nop_labels)
+    g_view = list(map(lambda i: build_view(i, g_labels), nop_labels))
     g_nout = len(g_labels_out)
     g_count = count
     
     return g_labels, g_view, g_nout, g_count
 
-def build_global_shape(g_view, op_shapes, g_count):
+def build_global_shape(g_view, op_shapes):
     view_shapes = []
     g_masks = []
     for view, op_shape in zip(g_view, op_shapes):
@@ -378,25 +378,23 @@ def plan_squeeze(plan, op, op_axes, op_shape, squeeze_axes):
     step = paddle.squeeze, [varname], varname, squeeze_dims
     plan.add_step(step)
 
-def plan_reduce(plan, op, reduce_dims):
+def plan_reduce(plan, op, reduce_dims, keepdim):
     '''
     Add reduce to the plan
     '''
     varname = f'op{op}'
 
-    f = lambda var, dims: paddle.sum(var, dims, keepdim=True)
+    f = lambda var, dims: paddle.sum(var, dims, keepdim=keepdim)
     step = f, [varname], varname, reduce_dims
     plan.add_step(step)
 
-    # Be aware that the op label string is not updated yet...
-
-def plan_scalar_prod(plan, operands, op1, op2):    
+def plan_scalar_prod(plan, op1, op2):
     varnames = [f'op{op1}', f'op{op2}']
-    f = lambda var1, var2: var1 * var2
+    f = lambda var1, var2: paddle.sum(var1) * var2
     step = f, varnames, varnames[1]
     plan.add_step(step)
 
-def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K):
+def plan_matmul(plan, g_view, op1, op2, g_op_masks, g_shape, I, J1, J2, K):
     '''
     plan matmul
     '''
@@ -404,15 +402,22 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     # Then apply matmul(x, y, transpose_x=False, tranpose_y=True)
     var1, var2 = f'op{op1}', f'op{op2}'
 
+    op1_view, op2_view = [g_view[op] for op in (op1, op2)]
+
     # Note, I may index into -1
-    I1_dims = [op1_axes[ax] for ax in I if op1_axes[ax] >= 0]
-    I2_dims = [op2_axes[ax] for ax in I if op2_axes[ax] >= 0]
-    J1_dims = [op1_axes[ax] for ax in J1]
-    J2_dims = [op2_axes[ax] for ax in J2]
-    K1_dims = [op1_axes[ax] for ax in K]
-    K2_dims = [op2_axes[ax] for ax in K]
-    I1_shape, J1_shape, K1_shape = [[op1_shape[dim] for dim in dims] for dims in (I1_dims, J1_dims, K1_dims)]
-    I2_shape, J2_shape, K2_shape = [[op2_shape[dim] for dim in dims] for dims in (I2_dims, J2_dims, K2_dims)]
+    I1_dims = [op1_view[ax] for ax in I if op1_view[ax] >= 0]
+    I2_dims = [op2_view[ax] for ax in I if op2_view[ax] >= 0]
+    J1_dims = [op1_view[ax] for ax in J1]
+    J2_dims = [op2_view[ax] for ax in J2]
+    K1_dims = [op1_view[ax] for ax in K]
+    K2_dims = [op2_view[ax] for ax in K]
+
+    op1_mask, op2_mask = [g_op_masks[op] for op in (op1, op2)]
+    op1_vshape = [s if m else 1 for s, m in zip(g_shape, op1_mask)]
+    op2_vshape = [s if m else 1 for s, m in zip(g_shape, op2_mask)]
+
+    I1_shape, J1_shape, K1_shape =  [[op1_vshape[ax] for ax in axes] for axes in (I, J1, K)]
+    I2_shape, J2_shape, K2_shape =  [[op2_vshape[ax] for ax in axes] for axes in (I, J2, K)]
     K1_size, J1_size, J2_size = prod(K1_shape), prod(J1_shape), prod(J2_shape)
 
     perm1 = I1_dims + J1_dims + K1_dims
@@ -438,7 +443,7 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
         #         new_dim = perm2.index(dim)
         #         op2_axes[i] = new_dim
 
-    # In case no K... dimensions remain, do a broadcast
+    # In case of no K... dimensions, do a broadcast
     if not K:
         # unsqueeze operands include J1...J2... dimensions
         if J2:
@@ -487,10 +492,7 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
     # Note, this is static deduction, not by reading the tensor shape at runtime
     result_shape = [1] * len(I)
     for i, ax in enumerate(I):
-        dim1, dim2 = op1_axes[ax], op2_axes[ax]
-        s = 1 if dim1 < 0 else op1_shape[dim1]
-        s = s if dim2 < 0 else max(s, op2_shape[dim2])
-        result_shape[i] = s
+        result_shape[i] = max(op1_vshape[ax], op2_vshape[ax])
     if J1:
         result_shape += J1_shape
     if J2:
@@ -502,55 +504,59 @@ def plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1,
         plan.add_step(step)
 
     # Wrap up, updating auxiliary data
-    op2_shape.clear()
-    for s in result_shape:
-        op2_shape.append(s)
+    # Updating g_mask for I and J axes
+    for i, ax in enumerate(I + J1 + J2):
+        op2_mask[ax] = (result_shape[i] > 1)
 
-    for ax in range(len(op2_axes)):
-        op2_axes[ax] = -1
+    for ax in K:
+        op2_mask[ax] = False
+
+    for ax in range(len(op2_view)):
+        op2_view[ax] = -1
     dim = 0
-    for ax in I:
-        op2_axes[ax], dim = dim, dim+1
-    for ax in J1 + J2:
-        op2_axes[ax], dim = dim, dim+1
+    for ax in I + J1 + J2:
+        op2_view[ax], dim = dim, dim+1   
 
-def plan_summation(plan, ops, nop_axes, nop_shapes, op1, op2, ndims_bcast, label_count):
+def plan_summation(plan, g_view, op1, op2, g_op_masks, g_shape, g_count, n_bcast):
     '''
     Plan various kinds of summation
     '''
-    op1_axes, op2_axes = [nop_axes[op] for op in (op1, op2)]
-    op1_shape, op2_shape = [nop_shapes[op] for op in (op1, op2)]
+    op1_view, op2_view = [g_view[op] for op in (op1, op2)]
+    op1_mask, op2_mask = [g_op_masks[op] for op in (op1, op2)]
 
-    ndims = len(op1_axes)
-    ndims_out = ndims - len(label_count)
+    ndim = len(op1_view)
+    nout = ndim - len(g_count)
 
-    count = [0] * ndims_out + label_count
+    count = [0] * nout + g_count
 
-    I, K, J1, J2 = list(range(ndims_bcast)), [], [], []
+    I, K, J1, J2 = list(range(n_bcast)), [], [], []
 
-    for ax in range(ndims_bcast, ndims):
-        dim1, dim2 = op1_axes[ax], op2_axes[ax]
-
+    for ax, dim1, dim2 in zip(range(n_bcast, ndim), op1_view[n_bcast:], op2_view[n_bcast:]):
         if (dim1 != -1) != (dim2 != -1):
             if dim1 != -1:
                 J1.append(ax)
             else:
                 J2.append(ax)
         elif dim1 != -1:
-            if count[ax] == 2:
-                # kill this axis
-                K.append(ax)
-                count[ax] = 0   
+            # If both dims are masked plus the remaining count is 2 then it's time to combine
+            if op1_mask[ax] and op2_mask[ax]:
+                if count[ax] == 2:
+                    # kill this axis
+                    K.append(ax)
+                    count[ax] = 0
+                else:
+                    I.append(ax)
+                    count[ax] -= 1
             else:
                 I.append(ax)
-                # Decrement count
-                if ax >= ndims_out:
-                    label_count[ax - ndims_out] -= 1
+
+    # Update g_count
+    g_count[:] = count[nout:]
 
     # Now it's OK to merge the K dims as the same shape holds
     # print(f'I: {I}   J1: {J1}    J2: {J2}   K: {K}')
 
-    plan_matmul(plan, op1, op2, op1_axes, op2_axes, op1_shape, op2_shape, I, J1, J2, K)
+    plan_matmul(plan, g_view, op1, op2, g_op_masks, g_shape, I, J1, J2, K)
 
 def rearrange(axes):
     perm, fill = [], []
@@ -640,7 +646,7 @@ def reorder_ops(nop_axes):
     return perm
 
 # def plan_einsum(operands, nop_axes, ndims_bcast, label_count):
-def plan_einsim(operands, g_view, g_shape, g_op_masks, g_count):
+def plan_einsum(operands, g_view, g_shape, g_op_masks, g_count, n_bcast):
     '''
     Plans the actual execution steps.
 
@@ -656,7 +662,6 @@ def plan_einsim(operands, g_view, g_shape, g_op_masks, g_count):
     plan = Plan()
     op_names = [f'op{i}' for i in range(nop)]
     list(map(plan.set_var, op_names, operands))
-    nop_shapes = [list(op.shape) for op in operands]
 
     # In case no dimensions to combine, do broadcast straight across
     if not g_count:
@@ -674,25 +679,27 @@ def plan_einsim(operands, g_view, g_shape, g_op_masks, g_count):
     #     if squeeze_axes:
     #         plan_squeeze(plan, i, nop_axes[i], nop_shapes[i], squeeze_axes)
 
-    # Down count the trivial dimensions on each axis >= nout
+    # Down count axis >= nout and degenerate dimensions (masked is not set)
     for view, mask in zip(g_view, g_op_masks):
         down_count = [1 if (dim > -1 and not masked) else 0 for dim, masked in zip(view[nout:], mask[nout:])]
         for i, d in enumerate(down_count):
             g_count[i] -= d
 
-    # Reduce dimensions whose g_mask is set and g_count == 1
+    # Reduce any dimension for which g_mask is set and g_count == 1
     for i, view, mask in zip(range(nop), g_view, g_op_masks):
         to_reduce = []
         for dim, masked, count in zip(view[nout:], mask[nout:], g_count):
             to_reduce.append(dim if (masked and count == 1) else -1)
         
-        reduce_dims = filter(lambda x: x > -1, to_reduce)
-        plan_reduce(plan, i, reduce_dims)
+        reduce_dims = list(filter(lambda x: x > -1, to_reduce))
+        if reduce_dims:
+            plan_reduce(plan, i, reduce_dims, keepdim=True)
 
+        # Unset mask and decrease g_count for the reduced dimensions
         for i, d in enumerate(to_reduce):
             ax = i + nout
-            mask[ax] = mask[ax] and (d < 0)   
-            g_count[i] -= (0 if d < 0 else 1)
+            mask[ax] = mask[ax] and (d == -1)
+            g_count[i] -= 0 if d == -1 else 1
 
     # Plan the summations over the operand sequence
     for i in range(nop):
@@ -718,11 +725,19 @@ def plan_einsim(operands, g_view, g_shape, g_op_masks, g_count):
         #  (4) Elsewise, either I... or J... not empty, and K... not empty, use a general matmul
 
         # Resolve the summation kind: dot, matmul or *
-        if all(dim < 0 for dim in nop_axes[i-1]):
+        if not any(g_op_masks[i-1]):
             # op1 is a scalar
-            plan_scalar_prod(plan, operands, i-1, i)
+            plan_scalar_prod(plan, i-1, i)
         else:
-            plan_summation(plan, operands, nop_axes, nop_shapes, i-1, i, ndims_bcast, label_count)
+            plan_summation(plan, g_view, i-1, i, g_op_masks, g_shape, g_count, n_bcast)
+
+    # for ax, dim in enumerate(g_view[nop-1][:nout]):
+    #     assert dim == ax
+    assert all(not masked for masked in g_op_masks[nop-1][nout:])
+
+    reduce_dims = [dim for dim in g_view[nop-1][nout:] if dim != -1]
+    if reduce_dims:
+        plan_reduce(plan, nop-1, reduce_dims, keepdim=False)
 
     return plan
 
@@ -887,10 +902,11 @@ def einsum(equation, *operands):
     operands = [operands[i] for i in perm]
     nop_labels = [nop_labels[i] for i in perm]
     g_view = [g_view[i] for i in perm]
+    g_op_masks = [g_op_masks[i] for i in perm]
 
     # Now we're ready to build up an execution plan
     # args = [operands, global_index, n_bcast_dims, combine_count]
-    args = operands, g_view, g_shape, g_op_masks, g_count
+    args = operands, g_view, g_shape, g_op_masks, g_count, n_bcast_dims
     plan = plan_einsum(*args)
     result = plan.execute()
 
@@ -899,11 +915,11 @@ def einsum(equation, *operands):
 if __name__ == '__main__':
     import numpy as np
 
-    x = paddle.rand([1, 5, 2, 2, 3, 4])
-    y = paddle.rand([5, 2, 3, 4])
-    z = paddle.rand([2, 1, 2])
-    t = paddle.rand([1, 5, 2, 3, 4])
-    einsum('abcdef, bcef, cad', x, y, z)
+    # x = paddle.rand([1, 5, 2, 2, 3, 4])
+    # y = paddle.rand([5, 2, 3, 4])
+    # z = paddle.rand([2, 1, 2])
+    # t = paddle.rand([1, 5, 2, 3, 4])
+    # einsum('abcdef, bcef, cad', x, y, z)
 
     x = np.random.randn(5, 1, 10000)
     y = np.random.randn(100, 10000)
@@ -935,7 +951,7 @@ if __name__ == '__main__':
         print(einsum(eqn, tx, tx))
 
     equations = [
-        'i,j->ij',
+        # 'i,j->ij',
         'i,j->'
     ]
     for eqn in equations:
