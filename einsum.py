@@ -860,11 +860,6 @@ def einsum(equation, *operands):
     # e.g. 1 for ['ij', 'i.', '.k']
     n_bcast_dims = max(map(lambda s: s.count('.'), nop_labels))
 
-    # Parse or infer output labels. The broadcasting dimensions should be taken care of.
-    # Following the Numpy's rule, the output labels must include the broadcasting dimensions,
-    # if there are any. 
-    out_labels, combine_labels, combine_count  = part_labels(nop_labels, rhs, n_bcast_dims)
-
     # Build the data structures for planning. It's helpful to think of all the operands
     # broadcasting together from a global view. In this view, dimensions from multiple 
     # operands are mapped to the same position if they are labeled uniquely. Broadcasting
@@ -915,11 +910,11 @@ def einsum(equation, *operands):
 if __name__ == '__main__':
     import numpy as np
 
-    # x = paddle.rand([1, 5, 2, 2, 3, 4])
-    # y = paddle.rand([5, 2, 3, 4])
-    # z = paddle.rand([2, 1, 2])
-    # t = paddle.rand([1, 5, 2, 3, 4])
-    # einsum('abcdef, bcef, cad', x, y, z)
+    x = paddle.rand([1, 5, 2, 2, 3, 4])
+    y = paddle.rand([5, 2, 3, 4])
+    z = paddle.rand([2, 1, 2])
+    t = paddle.rand([1, 5, 2, 3, 4])
+    einsum('abcdef, bcef, cad', x, y, z)
 
     x = np.random.randn(5, 1, 10000)
     y = np.random.randn(100, 10000)
