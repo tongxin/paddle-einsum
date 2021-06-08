@@ -28,8 +28,8 @@ def get_funcs(lib):
         to_tensor = lambda x: torch.tensor(x, dtype=torch.double, device='cuda:0')
     if lib == 'paddle':
         import paddle
-        # from einsum import einsum
-        from nlp_einsum import einsum
+        from einsum import einsum
+        # from nlp_einsum import einsum
         Linear = lambda x, y: paddle.nn.Linear(x, y)
         softmax = paddle.nn.functional.softmax
         to_tensor = lambda x: paddle.to_tensor(x, dtype='float32')
