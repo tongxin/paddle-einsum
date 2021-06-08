@@ -565,8 +565,6 @@ class Plan:
         res = None
         for f, in_varnames, out_varname, *args in self.steps:
             print(repr((out_varname, f, *in_varnames, *args)))
-            if out_varname:
-                self.set_var(out_varname, res)
         return res
 
     def execute(self):
@@ -838,6 +836,7 @@ def einsum(equation, *operands):
     # args = [operands, global_index, n_bcast_dims, combine_count]
     args = operands, g_view, g_shape, g_op_masks, g_count, n_bcast_dims
     plan = plan_einsum(*args)
+    plan.show()
     result = plan.execute()
 
     return result
