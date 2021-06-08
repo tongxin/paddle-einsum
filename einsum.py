@@ -15,6 +15,7 @@
 import itertools
 import re
 import paddle
+from paddle.tensor.stat import var
 
 __all__ = ['einsum']
 
@@ -486,17 +487,16 @@ def plan_summation(plan, g_view, op1, op2, g_op_masks, g_shape, g_count, n_bcast
             else:
                 J2.append(ax)
         elif dim1 != -1:
+            if ax < nout:
+                I.append(ax) 
             # If both dims are masked plus the remaining count is 2 then it's time to combine
-            if op1_mask[ax] and op2_mask[ax]:
-                if count[ax] == 2:
-                    # kill this axis
-                    K.append(ax)
-                    count[ax] = 0
-                else:
-                    I.append(ax)
-                    count[ax] -= 1
+            elif count[ax] <= 2:
+                # kill this axis
+                K.append(ax)
+                count[ax] = 0
             else:
                 I.append(ax)
+                count[ax] -= 1
 
     # Update g_count
     g_count[:] = count[nout:]
@@ -669,6 +669,15 @@ def plan_einsum(operands, g_view, g_shape, g_op_masks, g_count, n_bcast):
     # for ax, dim in enumerate(g_view[nop-1][:nout]):
     #     assert dim == ax
     assert all(not masked for masked in g_op_masks[nop-1][nout:])
+
+    if any(ax != dim for ax, dim in enumerate(g_view[nop-1][:nout])):
+        perm = [dim for dim in g_view[nop-1] if dim >= 0]
+        varname = f'op{nop-1}'
+        step = paddle.transpose, [varname], varname, perm
+        plan.add_step(step)
+        g_view[nop-1][:nout] = range(nout)
+
+    print(g_view[nop-1])
 
     squeeze_dims = [dim for dim in g_view[nop-1][nout:] if dim != -1]
     if squeeze_dims:
@@ -886,9 +895,9 @@ if __name__ == '__main__':
 
     equations = [               \
         'ijk, jk',              \
-        '...k, ...k->...k',     \
-        'ij..., j...',          \
-        'ij..., j...->...'      \
+        # '...k, ...k->...k',     \
+        # 'ij..., j...',          \
+        # 'ij..., j...->...'      \
     ]
 
     for eqn in equations:
