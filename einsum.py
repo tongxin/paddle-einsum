@@ -287,7 +287,7 @@ def has_duplicated_labels(labels):
     Returns True if there is any duplicate label.
     '''
     labels = labels.replace('.', '')
-    return any(l in labels[i+1:] for i, l in enumerate(labels))
+    return len(labels) > len(set(labels)) 
 
 def diagonalize(labels, operand):
     '''
@@ -328,26 +328,6 @@ def diagonalize(labels, operand):
     new_op = create_op_view(operand, new_sizes, new_strides)
     return new_labels, new_op
 
-
-
-
-def verify_shape(axes_list, operands):
-    # for axes in axes_list:
-        # print(axes)
-    op_shapes = [op.shape for op in operands]
-    for ax_dims in zip(*axes_list):
-        # axes are a column of nop input dimension axes. -1 represents new axis
-        # all non size-one dimensions must have the same size
-        sizes, ops, op_dims = [], [], []
-        for dim, shape, op in zip(ax_dims, op_shapes, operands):
-            if dim > -1 and shape[dim] > 1:
-                sizes.append(shape[dim])
-                ops.append(op)
-                op_dims.append(dim)
-
-        for s1, s2, ax1, ax2, op1, op2 in zip(sizes, sizes[1:], op_dims, op_dims[1:], ops, ops[1:]):
-            assert s1 == s2, f'Dimension {ax1} in {op1.name} and dimension {ax2} in {op2.name} do not match in size.'
-
 def prod(iter, default=1):
     if len(iter):
         res = 1
@@ -355,28 +335,6 @@ def prod(iter, default=1):
             res *= s
         return res
     return default
-
-def plan_squeeze(plan, op, op_axes, op_shape, squeeze_axes):
-    varname = f'op{op}'
-    squeeze_dims = []
-
-    # Update axes and reset mappings for squeezed dims
-    for ax in squeeze_axes:
-        dim = op_axes[ax]
-        squeeze_dims.append(dim)
-        op_axes[ax] = -1
-    for dim in sorted(squeeze_dims)[-1:]:
-        op_shape.pop(dim)
-
-    dims_left = sorted(dim for dim in op_axes if dim >= 0)
-    for i in range(len(op_axes)):
-        old = op_axes[i]
-        if old >= 0:
-            op_axes[i] = dims_left.index(old)
-    # Be aware that the op label string is not updated yet...
-
-    step = paddle.squeeze, [varname], varname, squeeze_dims
-    plan.add_step(step)
 
 def plan_reduce(plan, op, reduce_dims, keepdim):
     '''
@@ -427,21 +385,11 @@ def plan_matmul(plan, g_view, op1, op2, g_op_masks, g_shape, I, J1, J2, K):
         # print(f'perm1: {perm1}')
         step = paddle.transpose, [var1], var1, perm1
         plan.add_step(step)
-        # update axes index
-        # for i, dim in enumerate(op1_axes):
-        #     if dim >= 0:
-        #         new_dim = perm1.index(dim)
-        #         op1_axes[i] = new_dim
 
     if any(i != dim for i, dim in enumerate(perm2)):
         # print(f'perm2: {perm2}')
         step = paddle.transpose, [var2], var2, perm2
         plan.add_step(step)
-        # update axes index
-        # for i, dim in enumerate(op2_axes):
-        #     if dim >= 0:
-        #         new_dim = perm2.index(dim)
-        #         op2_axes[i] = new_dim
 
     # In case of no K... dimensions, do a broadcast
     if not K:
@@ -668,17 +616,6 @@ def plan_einsum(operands, g_view, g_shape, g_op_masks, g_count, n_bcast):
         plan_broadcast(plan, operands, g_view)
         return plan
 
-    # # Canonicalize by removing size-1 to-combine dimensions
-    # for i, op_axes, shape in zip(range(nop), g_view, nop_shapes):
-    #     squeeze_axes = []
-    #     for j in range(ndims_out, ndims):
-    #         dim = op_axes[j]
-    #         if dim >= 0 and shape[dim] == 1:
-    #             squeeze_axes.append(j)
-    #             label_count[j-ndims_out] -= 1
-    #     if squeeze_axes:
-    #         plan_squeeze(plan, i, nop_axes[i], nop_shapes[i], squeeze_axes)
-
     # Down count axis >= nout and degenerate dimensions (masked is not set)
     for view, mask in zip(g_view, g_op_masks):
         down_count = [1 if (dim > -1 and not masked) else 0 for dim, masked in zip(view[nout:], mask[nout:])]
@@ -735,9 +672,12 @@ def plan_einsum(operands, g_view, g_shape, g_op_masks, g_count, n_bcast):
     #     assert dim == ax
     assert all(not masked for masked in g_op_masks[nop-1][nout:])
 
-    reduce_dims = [dim for dim in g_view[nop-1][nout:] if dim != -1]
-    if reduce_dims:
-        plan_reduce(plan, nop-1, reduce_dims, keepdim=False)
+    squeeze_dims = [dim for dim in g_view[nop-1][nout:] if dim != -1]
+    if squeeze_dims:
+        # plan_reduce(plan, nop-1, reduce_dims, keepdim=False)
+        varname = f'op{nop-1}'
+        step = paddle.squeeze, [varname], varname, squeeze_dims
+        plan.add_step(step)
 
     return plan
 
@@ -883,13 +823,8 @@ def einsum(equation, *operands):
     g_labels, g_view, g_nout, g_count = build_global_view(nop_labels, rhs, n_bcast_dims)
     g_shape, g_op_masks = build_global_shape(g_view, [op.shape for op in operands])
 
-    g_labels_out = g_labels[:g_nout]
-    g_labels_sum = g_labels[g_nout:]
-
-    print(f'labels => output: {g_labels_out}   combine: {g_labels_sum}')
-
-    # Verify that all aligned dimensions are broadcastable in size across operands
-    # verify_shape(g_view, operands)
+    # g_labels_out, g_labels_sum = g_labels[:g_nout], g_labels[g_nout:]
+    # print(f'labels => output: {g_labels_out}   combine: {g_labels_sum}')
 
     # Reorder the operands and possibly reduce the summation complexity
     perm = reorder_ops(g_view)
@@ -909,18 +844,46 @@ def einsum(equation, *operands):
 
 if __name__ == '__main__':
     import numpy as np
+    
+    np.random.seed(102)
+    # -------------------
+    # Group 1
+    # -------------------
+    shapes = [
+        [1, 5, 2, 2, 3, 4],
+        [5, 2, 3, 4],
+        [2, 1, 2],
+        [1, 5, 2, 3, 4]
+    ]
+    x, y, z, t = [np.random.rand(*s) for s in shapes]
+    tx, ty, tz, tt = [paddle.to_tensor(_) for _ in (x, y, z, t)]
 
-    x = paddle.rand([1, 5, 2, 2, 3, 4])
-    y = paddle.rand([5, 2, 3, 4])
-    z = paddle.rand([2, 1, 2])
-    t = paddle.rand([1, 5, 2, 3, 4])
-    einsum('abcdef, bcef, cad', x, y, z)
+    equations = [
+        'abcdef, bcef, cad'
+    ]
+    for e in equations:
+        np_out = np.einsum(e, x, y, z)
+        pd_out = einsum(e, tx, ty, tz)
+        assert np.allclose(np_out, pd_out)
 
-    x = np.random.randn(5, 1, 10000)
-    y = np.random.randn(100, 10000)
+    # -------------------
+    # Group 2
+    # -------------------
+    shapes = [
+        [5, 1, 10000],
+        [100, 10000]
+    ]
+    x, y = [np.random.randn(*s) for s in shapes]
+    tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
 
-    tx = paddle.to_tensor(x)
-    ty = paddle.to_tensor(y)
+    equations = [
+        'ijk->j'
+    ]
+
+    for eqn in equations:
+        np_out = np.einsum(eqn, x)
+        pd_out = einsum(eqn, tx)
+        assert np.allclose(np_out, pd_out)
 
     equations = [               \
         'ijk, jk',              \
@@ -929,42 +892,71 @@ if __name__ == '__main__':
         'ij..., j...->...'      \
     ]
 
-    einsum('ijk->j', tx)
-    
     for eqn in equations:
-        print(einsum(eqn, tx, ty))
+        np_out = np.einsum(eqn, x, y)
+        pd_out = einsum(eqn, tx, ty)
+        assert np.allclose(np_out, pd_out)
 
-    np.random.seed(102)
+    # -------------------
+    # Group 3
+    # -------------------
+    shapes = [
+        [4],
+        [5]
+    ]
+    x, y = [np.random.randn(*s) for s in shapes]
+    tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
 
-    tx = paddle.to_tensor(np.random.rand(4))
-    ty = paddle.to_tensor(np.random.rand(5))
-
-    equations =[
+    equations = [
         'i,i->'
     ]
     for eqn in equations:
-        print(einsum(eqn, tx, tx))
+        np_out = np.einsum(eqn, x, x)
+        pd_out = einsum(eqn, tx, tx)
+        assert np.allclose(np_out, pd_out)
 
-    equations = [
-        # 'i,j->ij',
-        'i,j->'
+    equations =[
+        'i,j->',
+        'i,j->ij'
     ]
     for eqn in equations:
-        print(einsum(eqn, tx, ty))
+        np_out = np.einsum(eqn, x, y)
+        pd_out = einsum(eqn, tx, ty)
+        assert np.allclose(np_out, pd_out)
 
-    x = np.random.randn(10, 1, 4, 256)
-    y = np.random.randn(256, 10, 1)
-    
-    tx, ty = paddle.to_tensor(x), paddle.to_tensor(y)
+    # -------------------
+    # Group 4
+    # -------------------
+    shapes = [
+        [10, 1, 4, 256],
+        [256, 10, 1]
+    ]
+    x, y = [np.random.randn(*s) for s in shapes]
+    tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
 
     equations = [
         'abcd,dfg->d'
     ]
     for eqn in equations:
-        print(einsum(eqn, tx, ty))
+        np_out = np.einsum(eqn, x, y)
+        pd_out = einsum(eqn, tx, ty)
+        assert np.allclose(np_out, pd_out)
 
-    x = np.random.rand(10000, 100, 10)
+    # -------------------
+    # Group 5
+    # -------------------
+    shapes = [
+        [10000, 100, 10]
+    ]
+    x = np.random.randn(*shapes[0])
     tx = paddle.to_tensor(x)
+    
+    equations = [
+        'ijk->'
+    ]
 
-    print(einsum('ijk->', tx))
+    for eqn in equations:
+        np_out = np.einsum(eqn, x)
+        pd_out = einsum(eqn, tx)
+        assert np.allclose(np_out, pd_out)
 

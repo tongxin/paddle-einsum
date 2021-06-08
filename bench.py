@@ -1,6 +1,6 @@
 import numpy as np
 import paddle
-import torch
+# import torch
 from einsum import einsum
 from nlp_einsum import einsum as nlp_einsum
 
@@ -42,7 +42,7 @@ def bench_transpose():
         'np': r"np.einsum('ijk->jki', x).shape", \
         'my': r"einsum('ijk->jki', px).shape", \
         'nlp': r"nlp_einsum('ijk->jki', px).shape", \
-        'torch': r"torch.einsum('ijk->jki', tx).shape"
+        # 'torch': r"torch.einsum('ijk->jki', tx).shape"
     }
     print(r"times for 'ijk->jki'")
     timeit(code_snippets)
@@ -52,7 +52,7 @@ def bench_matrix_vector():
         'np': r"np.einsum('ikj,k', x, y).shape", \
         'my': r"einsum('ikj,k', px, py).shape", \
         'nlp': r"nlp_einsum('ikj,k', px, py).shape", \
-        'torch': r"torch.einsum('ikj,k', tx, ty).shape"
+        # 'torch': r"torch.einsum('ikj,k', tx, ty).shape"
     }
     print(r"times for 'ikj,k'")
     timeit(code_snippets)
@@ -62,7 +62,7 @@ def bench_bmm():
         'np': r"np.einsum('ikj,kg', x, y).shape", \
         'my': r"einsum('ikj,kg', px, py).shape", \
         'nlp': r"nlp_einsum('ikj,kg', px, py).shape", \
-        'torch': r"torch.einsum('ikj,kg', tx, ty).shape"
+        # 'torch': r"torch.einsum('ikj,kg', tx, ty).shape"
     }
     print(r"times for 'ikj,kg'")
     timeit(code_snippets)
@@ -74,7 +74,7 @@ if __name__ == '__main__':
 
     x = np_x_ultra_large
     px = paddle.to_tensor(x)
-    tx = torch.tensor(x)
+    # tx = torch.tensor(x)
     # tx = torch.tensor(x, device='cuda:0')
     bench_sum()
     bench_sum1()
@@ -82,12 +82,12 @@ if __name__ == '__main__':
 
     y = np.random.rand(1000)
     py = paddle.to_tensor(y)
-    ty = torch.tensor(y)
+    # ty = torch.tensor(y)
     # ty = torch.tensor(y, device='cuda:0')
     bench_matrix_vector()
 
     y = np_y_large
     py = paddle.to_tensor(y)
-    ty = torch.tensor(y)
+    # ty = torch.tensor(y)
     # ty = torch.tensor(y, device='cuda:0')
     bench_bmm()

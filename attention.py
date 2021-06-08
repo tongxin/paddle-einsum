@@ -1,4 +1,3 @@
-# from nlp_einsum import einsum
 
 def get_funcs(lib):
     def attention(X, dim, heads):
@@ -29,10 +28,10 @@ def get_funcs(lib):
         to_tensor = lambda x: torch.tensor(x, dtype=torch.double, device='cuda:0')
     if lib == 'paddle':
         import paddle
-        import einsum
+        # from einsum import einsum
+        from nlp_einsum import einsum
         Linear = lambda x, y: paddle.nn.Linear(x, y)
         softmax = paddle.nn.functional.softmax
-        einsum = einsum.einsum
         to_tensor = lambda x: paddle.to_tensor(x, dtype='float32')
     return to_tensor, attention
 
