@@ -679,7 +679,7 @@ def plan_einsum(operands, g_view, g_shape, g_op_masks, g_count, n_bcast):
         dim = 0
         for ax, d in enumerate(view):
             if d != -1:
-                view[ax], dim = dim+1, dim
+                view[ax], dim = dim, dim+1
  
     squeeze_dims = [dim for dim in view[nout:] if dim != -1]
     if squeeze_dims:
@@ -855,122 +855,118 @@ def einsum(equation, *operands):
 if __name__ == '__main__':
     import numpy as np
 
-    x = np.random.rand(2, 5)
-    out = einsum('ij->j', paddle.to_tensor(x))
-    print(out)
+    np.random.seed(102)
+    # -------------------
+    # Group 1
+    # -------------------
+    shapes = [
+        [1, 5, 2, 2, 3, 4],
+        [5, 2, 3, 4],
+        [2, 1, 2],
+        [1, 5, 2, 3, 4]
+    ]
+    x, y, z, t = [np.random.rand(*s) for s in shapes]
+    tx, ty, tz, tt = [paddle.to_tensor(_) for _ in (x, y, z, t)]
 
-    # np.random.seed(102)
-    # # -------------------
-    # # Group 1
-    # # -------------------
-    # shapes = [
-    #     [1, 5, 2, 2, 3, 4],
-    #     [5, 2, 3, 4],
-    #     [2, 1, 2],
-    #     [1, 5, 2, 3, 4]
-    # ]
-    # x, y, z, t = [np.random.rand(*s) for s in shapes]
-    # tx, ty, tz, tt = [paddle.to_tensor(_) for _ in (x, y, z, t)]
+    equations = [
+        'abcdef, bcef, cad'
+    ]
+    for e in equations:
+        np_out = np.einsum(e, x, y, z)
+        pd_out = einsum(e, tx, ty, tz).numpy()
+        assert np.allclose(np_out, pd_out)
 
-    # equations = [
-    #     'abcdef, bcef, cad'
-    # ]
-    # for e in equations:
-    #     np_out = np.einsum(e, x, y, z)
-    #     pd_out = einsum(e, tx, ty, tz)
-    #     assert np.allclose(np_out, pd_out)
+    # -------------------
+    # Group 2
+    # -------------------
+    shapes = [
+        [5, 1, 10000],
+        [100, 10000]
+    ]
+    x, y = [np.random.randn(*s) for s in shapes]
+    tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
 
-    # # -------------------
-    # # Group 2
-    # # -------------------
-    # shapes = [
-    #     [5, 1, 10000],
-    #     [100, 10000]
-    # ]
-    # x, y = [np.random.randn(*s) for s in shapes]
-    # tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
+    equations = [
+        'ijk->j'
+    ]
 
-    # equations = [
-    #     'ijk->j'
-    # ]
+    for eqn in equations:
+        np_out = np.einsum(eqn, x)
+        pd_out = einsum(eqn, tx).numpy()
+        assert np.allclose(np_out, pd_out)
 
-    # for eqn in equations:
-    #     np_out = np.einsum(eqn, x)
-    #     pd_out = einsum(eqn, tx)
-    #     assert np.allclose(np_out, pd_out)
+    equations = [               \
+        'ijk, jk',              \
+        # '...k, ...k->...k',     \
+        # 'ij..., j...',          \
+        # 'ij..., j...->...'      \
+    ]
 
-    # equations = [               \
-    #     'ijk, jk',              \
-    #     # '...k, ...k->...k',     \
-    #     # 'ij..., j...',          \
-    #     # 'ij..., j...->...'      \
-    # ]
+    for eqn in equations:
+        np_out = np.einsum(eqn, x, y)
+        pd_out = einsum(eqn, tx, ty).numpy()
+        assert np.allclose(np_out, pd_out)
 
-    # for eqn in equations:
-    #     np_out = np.einsum(eqn, x, y)
-    #     pd_out = einsum(eqn, tx, ty)
-    #     assert np.allclose(np_out, pd_out)
+    # -------------------
+    # Group 3
+    # -------------------
+    shapes = [
+        [4],
+        [5]
+    ]
+    x, y = [np.random.randn(*s) for s in shapes]
+    tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
 
-    # # -------------------
-    # # Group 3
-    # # -------------------
-    # shapes = [
-    #     [4],
-    #     [5]
-    # ]
-    # x, y = [np.random.randn(*s) for s in shapes]
-    # tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
+    equations = [
+        'i,i->'
+    ]
+    for eqn in equations:
+        np_out = np.einsum(eqn, x, x)
+        pd_out = einsum(eqn, tx, tx).numpy()
+        assert np.allclose(np_out, pd_out)
 
-    # equations = [
-    #     'i,i->'
-    # ]
-    # for eqn in equations:
-    #     np_out = np.einsum(eqn, x, x)
-    #     pd_out = einsum(eqn, tx, tx)
-    #     assert np.allclose(np_out, pd_out)
+    equations =[
+        'i,j->',
+        'i,j->ij'
+    ]
+    for eqn in equations:
+        np_out = np.einsum(eqn, x, y)
+        pd_out = einsum(eqn, tx, ty).numpy()
+        assert np.allclose(np_out, pd_out)
 
-    # equations =[
-    #     'i,j->',
-    #     'i,j->ij'
-    # ]
-    # for eqn in equations:
-    #     np_out = np.einsum(eqn, x, y)
-    #     pd_out = einsum(eqn, tx, ty)
-    #     assert np.allclose(np_out, pd_out)
+    # -------------------
+    # Group 4
+    # -------------------
+    shapes = [
+        [10, 1, 4, 256],
+        [256, 10, 1]
+    ]
+    x, y = [np.random.randn(*s) for s in shapes]
+    tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
 
-    # # -------------------
-    # # Group 4
-    # # -------------------
-    # shapes = [
-    #     [10, 1, 4, 256],
-    #     [256, 10, 1]
-    # ]
-    # x, y = [np.random.randn(*s) for s in shapes]
-    # tx, ty = [paddle.to_tensor(_) for _ in (x, y)]
+    equations = [
+        'abcd,dfg->d'
+    ]
+    for eqn in equations:
+        np_out = np.einsum(eqn, x, y)
+        pd_out = einsum(eqn, tx, ty).numpy()
+        assert np.allclose(np_out, pd_out)
 
-    # equations = [
-    #     'abcd,dfg->d'
-    # ]
-    # for eqn in equations:
-    #     np_out = np.einsum(eqn, x, y)
-    #     pd_out = einsum(eqn, tx, ty)
-    #     assert np.allclose(np_out, pd_out)
-
-    # # -------------------
-    # # Group 5
-    # # -------------------
-    # shapes = [
-    #     [10000, 100, 10]
-    # ]
-    # x = np.random.randn(*shapes[0])
-    # tx = paddle.to_tensor(x)
+    # -------------------
+    # Group 5
+    # -------------------
+    shapes = [
+        [10000, 100, 10]
+    ]
+    x = np.random.randn(*shapes[0])
+    tx = paddle.to_tensor(x)
     
-    # equations = [
-    #     'ijk->'
-    # ]
+    equations = [
+        'ijk->'
+    ]
 
-    # for eqn in equations:
-    #     np_out = np.einsum(eqn, x)
-    #     pd_out = einsum(eqn, tx)
-    #     assert np.allclose(np_out, pd_out)
+    for eqn in equations:
+        np_out = np.einsum(eqn, x)
+        pd_out = einsum(eqn, tx).numpy()
+        assert np.allclose(np_out, pd_out)
 
